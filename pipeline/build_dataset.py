@@ -64,10 +64,23 @@ from config import (
     MIN_EVENTS_PER_SEGMENT, MIN_SEGMENT_R2, PEARSON_OUTLIER_THRESHOLD,
     TRAIN_FRAC, VAL_FRAC, RANDOM_SEED,
     EVENT_CSV, TABLES_DIR, FIELD_NAMES,
-    HELD_OUT_BASIN_LIST, OUTLIER_BASINS,
+    HELD_OUT_BASIN_LIST,
 )
 
+# import os
+# import sys
+# add to path C:\Users\user\PycharmProjects\mek-models-satix-backend\optisat
+# import sys
+# sys.path.insert(0, r'C:\Users\user\PycharmProjects\mek-models-satix-backend')
+#
+# import os
+# optisat_path = r'C:\Users\user\PycharmProjects\mek-models-satix-backend\optisat'
+# print("optisat folder exists:", os.path.exists(optisat_path))
+# print("__init__.py exists:", os.path.exists(os.path.join(optisat_path, '__init__.py')))
 
+# Now try the import
+from optisat.db.duckdb_manager import DuckDBManager
+print("Import successful")
 from pipeline.features import PREV_SOURCE_COLS, CUM_SOURCE_COLS, RAW_DB_COLUMNS
 
 from optisat.db.duckdb_manager import DuckDBManager
@@ -610,8 +623,8 @@ def _assign_splits(
             return "held_out_test"
         df["split_held_out"] = df.apply(_get_held_out_split, axis=1)
 
-    elif basin_number in OUTLIER_BASINS:
-        df["split_held_out"] = "excluded"
+    # elif basin_number in OUTLIER_BASINS:
+    #     df["split_held_out"] = "excluded"
 
     else:
         # Clean basin — same random split as condition A
@@ -860,21 +873,24 @@ def _fill_missing_columns(df: pd.DataFrame, target_columns) -> None:
 
 
 def _attach_metadata(df: pd.DataFrame, basin_number: int, area_m2: float) -> None:
-    """Attach basin-level metadata columns."""
+    """
+    Attach basin-level metadata columns.
+
+    basin_role at build time:
+      'held_out' — basin is in HELD_OUT_BASIN_LIST (reserved for condition D/E test)
+      'clean'    — all other basins
+
+    NOTE: 'outlier' role is NOT assigned here. Outlier detection is performed
+    dynamically by analysis/basin_analysis.py which writes to outlier_basins.csv.
+    The model training scripts read that CSV at runtime to resolve basin sets.
+    """
     df["basin_number"] = basin_number
     df["facility"]     = int(str(basin_number)[0])
     df["field_name"]   = FIELD_NAMES.get(int(str(basin_number)[0]), str(basin_number))
     df["area_m2"]      = area_m2
 
-    # V2: tag basin role for evaluation conditions
-    # held_out  — never used in training; test-only for condition D
-    # outlier   — excluded from clean model (condition A)
-    # clean     — used in conditions A, B, D training
-    # all       — used in condition C only
     if basin_number in HELD_OUT_BASIN_LIST:
         df["basin_role"] = "held_out"
-    elif basin_number in OUTLIER_BASINS:
-        df["basin_role"] = "outlier"
     else:
         df["basin_role"] = "clean"
 

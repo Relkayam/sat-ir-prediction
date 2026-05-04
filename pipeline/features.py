@@ -112,50 +112,108 @@ LOG_TRANSFORM = {
     "cum_HL":  "log1p_cum_HL",
 }
 
+
+# Model 1 features (11 total after log transforms)
+# Final set selected by unconstrained forward stepwise on Condition E.
+# Elbow detected at step 7 (12th feature cum_TD worsened RMSE).
+# Full selection path: analysis/feature_selection_unconstrained.py
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Model 1 features (23 total after log transforms)
+# Model 1 features — FINAL SET (11 features after log transforms)
 # ─────────────────────────────────────────────────────────────────────────────
-# Used in: model1_decay.py, analysis/model_comparison.py, analysis/heatmap.py
 #
-# These are the RAW column names as they appear in event_dataset.csv.
-# prev_HL and cum_HL are replaced by their log1p versions at runtime
-# via prepare_features() — so the model actually sees 23 features:
-#   21 untransformed + log1p_prev_HL + log1p_cum_HL
+# Feature selection methodology (documented for reproducibility):
+# ---------------------------------------------------------------
+# Forward stepwise selection was performed on Condition E (45-basin training,
+# 5 held-out test basins never seen during training). Metric: RMSE on raw
+# IRD (cm/h) on held-out test set. LightGBM with well-established defaults.
 #
-# NOT included (tested and rejected):
-#   prev_IRD_at_reset — r=-0.07 with TARGET_M1, and dropna cost R² 0.397->0.308
-#   IRD_direction     — r=+0.005 with TARGET_M1 (between-reset trend != within-segment decay)
-#   month_sin/cos     — no improvement; seasonality already in cum_TW, cum_RD, cum_TD
+# Starting set: 5 mandatory features (top SHAP across conditions A, D, E)
+# Selection: greedy forward, unconstrained, run to all 21 features
+# See: outputs/tables/feature_selection_unconstrained.xlsx
+#      analysis/feature_selection_unconstrained.py
+#
+# Selection path (RMSE at each step):
+#   5 features: 0.7193 cm/h  (mandatory base)
+#   6 features: 0.6936 cm/h  +prev_TD      Δ=+0.026 ✓ strong
+#   7 features: 0.6794 cm/h  +prev_FT      Δ=+0.014 ✓ strong
+#   8 features: 0.6679 cm/h  +cum_TW       Δ=+0.012 ✓ strong
+#   9 features: 0.6659 cm/h  +cum_FT       Δ=+0.002 ✓ marginal
+#  10 features: 0.6504 cm/h  +prev_RD      Δ=+0.016 ✓ strong
+#  11 features: 0.6491 cm/h  +prev_RW      Δ=+0.001 ✓ marginal (retained)
+#  12 features: 0.6582 cm/h  +cum_TD       Δ=-0.009 ✗ worsened → STOP
+#
+# Features NOT selected (and why):
+#   cum_RD, cum_RW  — cumulative radiation features: partially collinear
+#                     with prev_RD, prev_RW and cum_TW. The most proximal
+#                     radiation signal (prev_*) dominates over cumulative.
+#   cum_TD          — first feature to worsen RMSE (-0.009): defines elbow
+#   log1p_cum_HL    — only recovers after cum_TD noise; not independently useful
+#   prev_TW         — only useful after log1p_cum_HL compensates cum_TD noise
+#   cum_DrT         — worsened RMSE at step 10 (-0.006)
+#   event_count     — compensates for noise from earlier bad additions
+#   prev_AL, prev_ML, prev_AF — consistently worsen RMSE; water level
+#                               and flooded area features add noise not signal
+#
+# Previously tested full 21-feature set:
+#   Condition E RMSE = 0.7117 cm/h  (worse than 11-feature set)
+#   This confirms the 21-feature model was overfitting to training basin
+#   idiosyncrasies — the reduced set generalises better to unseen basins.
+#
+# Physical interpretation of final 11 features:
+#   IRD_at_reset    — scale anchor: basin hydraulic conductivity ceiling
+#   prev_ALPHA      — drying fraction: ratio of recovery time to cycle time
+#   log1p_prev_HL   — hydraulic load: clogging intensity of previous event
+#   prev_DrT        — drying duration: absolute recovery time
+#   LCT             — time since reset: primary decay axis
+#   prev_TD         — temperature during previous drying: affects viscosity
+#                     and biological activity during surface recovery
+#   prev_FT         — flooding time: duration of clogging exposure
+#   cum_TW          — cumulative wetting temperature since reset: encodes
+#                     seasonal signal and accumulated biological activity
+#   cum_FT          — cumulative flooding time: total clogging load since reset
+#   prev_RD         — radiation during previous drying: photodegradation
+#                     of clogging layer — most proximal environmental signal
+#   prev_RW         — radiation during previous wetting: solar exposure
+#                     during flooding influences surface biofilm activity
+
+
+# NOT included (tested and rejected by forward stepwise selection):
+#   cum_RD, cum_RW      — collinear with prev_RD/prev_RW and cum_TW
+#   cum_TD              — worsened RMSE at step 7 (elbow)
+#   log1p_cum_HL        — only useful after noise compensation
+#   prev_TW             — only useful after multiple noise features added
+#   cum_DrT             — worsened RMSE at step 10
+#   event_count         — compensates for noise; not independently useful
+#   prev_AL, prev_ML, prev_AF — water level/area: noise not signal
+#
+# Previously rejected (V1, not tested in V2 stepwise):
+#   prev_IRD_at_reset   — r=-0.07, dropna cost caused R² 0.397→0.308
+#   IRD_direction       — r=+0.005 (between-reset trend ≠ within-segment)
+#   month_sin/cos       — captured by cum_TW and prev_TD
+#   DAT, DAR            — commented out: redundant with prev_TD/prev_RD
+
 MODEL1_RAW_FEATURES = [
-    # Previous event — operational
-    "prev_DrT",           # drying time before current event (primary recovery driver)
-    "prev_FT",            # flooding time of previous event
-    "prev_ALPHA",         # drying fraction of previous event (DrT / Ct)
-    "prev_HL",            # -> replaced by log1p_prev_HL at runtime
-    "prev_TW",            # temperature during previous wetting phase
-    "prev_RW",            # radiation during previous wetting phase
+    # ── Mandatory base (top SHAP, all conditions) ──────────────────────────
+    "IRD_at_reset",       # scale anchor — basin hydraulic conductivity
+    "prev_ALPHA",         # drying fraction = DrT / Ct
+    "prev_HL",            # -> log1p_prev_HL at runtime (skewness > 15)
+    "prev_DrT",           # drying time — absolute recovery duration
+    "LCT",                # time since reset — primary decay axis
+
+    # ── Step 1-3: high-value additions (Δ > 0.010 cm/h each) ──────────────
     "prev_TD",            # temperature during previous drying phase
-    "prev_RD",            # radiation during previous drying phase (photodegradation)
-    "prev_AL",            # water level of previous event
-    "prev_ML",            # max water level of previous event
-    "prev_AF",            # flooded area of previous event
-    # Cumulative since reset (captures progressive clogging load)
-    "cum_HL",             # -> replaced by log1p_cum_HL at runtime
-    "cum_DrT",            # total drying time since reset
-    "cum_FT",             # total flooding time since reset
-    "cum_TW",             # cumulative temperature (wet phase) — encodes seasonality
-    "cum_RW",             # cumulative radiation (wet phase)
-    "cum_TD",             # cumulative temperature (dry phase)
-    "cum_RD",             # cumulative radiation (dry phase)
-    # Position in segment
-    "LCT",                # load cycle time — time since reset (primary decay axis)
-    "event_count",        # event number within segment
-    # Baseline at segment start
-    "IRD_at_reset",       # IRD when segment began — anchors predictions to basin scale
-    # Daily ambient conditions (continuous seasonality signal)
-    # "DAT",                # daily average temperature — continuous seasonality + temp-dependent processes
-    # "DAR",                # daily average radiation — continuous seasonality + photodegradation signal
-    # 'TW',                # temperature during wet phase of current event — ambient conditions at the moment
+    "prev_FT",            # flooding time of previous event
+    "cum_TW",             # cumulative wetting temperature since reset
+
+    # ── Step 4: marginal but retained (Δ = +0.002 cm/h) ───────────────────
+    "cum_FT",             # cumulative flooding time since reset
+
+    # ── Step 5: strong recovery after plateau (Δ = +0.016 cm/h) ───────────
+    "prev_RD",            # radiation during previous drying (photodegradation)
+
+    # ── Step 6: marginal but retained (Δ = +0.001 cm/h) ───────────────────
+    "prev_RW",            # radiation during previous wetting phase
 ]
 
 # Final feature list used by the model (after log transforms).
