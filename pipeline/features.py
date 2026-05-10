@@ -222,75 +222,162 @@ MODEL1_FEATURES = [
     LOG_TRANSFORM.get(f, f) for f in MODEL1_RAW_FEATURES
 ]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Model 2 features (23 total)
-# ─────────────────────────────────────────────────────────────────────────────
-# Used in: model2_reset.py, analysis/heatmap.py
+# # ─────────────────────────────────────────────────────────────────────────────
+# # Model 2 features (23 total)
+# # ─────────────────────────────────────────────────────────────────────────────
+# # Used in: model2_reset.py, analysis/heatmap.py
+# #
+# # All features are aggregated from segment i-1 (the segment that just ended).
+# # Cross-segment history features are computed in build_dataset.py BEFORE the
+# # quality filter — this ensures IRD_direction always references the true
+# # previous reset, not the previous *good* reset.
+# #
+# # NOTE: prev_IRD_at_reset is kept as a feature even though the target is now
+# # the log-ratio — it serves as the denominator reference and carries
+# # important information about the basin's recent recovery level.
 #
-# All features are aggregated from segment i-1 (the segment that just ended).
-# Cross-segment history features are computed in build_dataset.py BEFORE the
-# quality filter — this ensures IRD_direction always references the true
-# previous reset, not the previous *good* reset.
+# # Aggregated from segment i-1
+# MODEL2_SEGMENT_FEATURES = [
+#     # Operational averages
+#     "mean_DrT",    # mean drying time across segment
+#     "mean_FT",     # mean flooding time across segment
+#     "mean_ALPHA",  # mean drying fraction (DrT / Ct) — consistent with Model 1
+#     "mean_HL",     # mean hydraulic load — ENDOGENOUS, fixed in heatmap
+#     # Totals
+#     "sum_DrT",     # total drying time (= mean_DrT x n_events)
+#     "sum_FT",      # total flooding time
+#     # Extremes
+#     "min_DrT",     # shortest drying period in segment
+#     "max_FT",      # longest flooding event in segment
+#     # Segment size
+#     "n_events",    # number of flooding events
+#     "total_LCT",   # total segment duration (h)
+#     # Weather
+#     "mean_RD",     # mean radiation during drying — key photodegradation driver
+#     "mean_TW",     # mean temperature (wet phase)
+#     "mean_TD",     # mean temperature (dry phase)
+#     # Last-event features: the drying period immediately before reset.
+#     # Physical rationale: the FINAL drying opportunity before tillage is
+#     # distinct from the segment average — a long sunny final drying period
+#     # maximises surface crust degradation just before the reset, directly
+#     # affecting how high IRD_at_reset will be. Confirmed by SHAP analysis.
+#     "last_DrT",    # DrT of the final event before reset
+#     "last_RD",     # radiation of the final drying period before reset
+# ]
 #
-# NOTE: prev_IRD_at_reset is kept as a feature even though the target is now
-# the log-ratio — it serves as the denominator reference and carries
-# important information about the basin's recent recovery level.
+# # Cross-segment history (computed in build_dataset.py before quality filter)
+# # prev_IRD_at_reset is the denominator for the log-ratio target and also
+# # serves as the primary autocorrelation feature.
+# MODEL2_HISTORY_FEATURES = [
+#     "prev_IRD_at_reset",       # IRD_at_reset of reset i-1 — denominator + autocorrelation
+#     "prev_prev_IRD_at_reset",  # IRD_at_reset of reset i-2 — two-step memory
+#     "IRD_direction",           # (IRD[i-1] - IRD[i-2]) / dt — recovery trend (cm/h/day)
+# ]
+#
+# # Seasonality at the reset date + daily ambient conditions
+# # month_sin ranks high in Model 2 feature importance — summer resets
+# # recover better than winter resets.
+# # DAT and DAR provide continuous ambient signal at the reset moment.
+# MODEL2_SEASON_FEATURES = [
+#     "month_sin",   # sin encoding — peak July (+1.0), trough January (-1.0)
+#     "month_cos",   # cos encoding — orthogonal component
+#     "DAT",         # daily avg temperature at reset moment — continuous seasonality
+#     "DAR",         # daily avg radiation at reset moment — continuous seasonality
+# ]
+#
+# # Final combined feature list for Model 2
+# MODEL2_FEATURES = (
+#     MODEL2_SEGMENT_FEATURES +
+#     MODEL2_HISTORY_FEATURES +
+#     MODEL2_SEASON_FEATURES
+# )
 
-# Aggregated from segment i-1
-MODEL2_SEGMENT_FEATURES = [
-    # Operational averages
-    "mean_DrT",    # mean drying time across segment
-    "mean_FT",     # mean flooding time across segment
-    "mean_ALPHA",  # mean drying fraction (DrT / Ct) — consistent with Model 1
-    "mean_HL",     # mean hydraulic load — ENDOGENOUS, fixed in heatmap
-    # Totals
-    "sum_DrT",     # total drying time (= mean_DrT x n_events)
-    "sum_FT",      # total flooding time
-    # Extremes
-    "min_DrT",     # shortest drying period in segment
-    "max_FT",      # longest flooding event in segment
-    # Segment size
-    "n_events",    # number of flooding events
-    "total_LCT",   # total segment duration (h)
-    # Weather
-    "mean_RD",     # mean radiation during drying — key photodegradation driver
-    "mean_TW",     # mean temperature (wet phase)
-    "mean_TD",     # mean temperature (dry phase)
-    # Last-event features: the drying period immediately before reset.
-    # Physical rationale: the FINAL drying opportunity before tillage is
-    # distinct from the segment average — a long sunny final drying period
-    # maximises surface crust degradation just before the reset, directly
-    # affecting how high IRD_at_reset will be. Confirmed by SHAP analysis.
-    "last_DrT",    # DrT of the final event before reset
-    "last_RD",     # radiation of the final drying period before reset
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Model 2 features — FINAL SET (11 features)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Feature selection methodology:
+# ---------------------------------------------------------------
+# Forward stepwise unconstrained selection on chrono split.
+# Metric: RMSE on raw IRD (cm/h) after back-transform on test split.
+# See: outputs/tables/feature_selection_m2.xlsx
+#      analysis/feature_selection_m2.py
+#
+# Selection path (RMSE at each step):
+#   Naive baseline : 0.8202 cm/h
+#    1 feature (month_sin)               : 0.7730  Δ=+0.047 ✓ huge
+#    2 features (prev_IRD_at_reset)      : 0.7557  Δ=+0.017 ✓ strong
+#    3 features (mean_ALPHA)             : 0.7450  Δ=+0.011 ✓ strong
+#    4 features (total_LCT)              : 0.7259  Δ=+0.019 ✓ strongest
+#    5 features (DAR)                    : 0.7195  Δ=+0.006 ✓ good
+#    6 features (prev_prev_IRD_at_reset) : 0.7170  Δ=+0.002 ✓ marginal
+#    7 features (sum_DrT)               : 0.7096  Δ=+0.008 ✓ good
+#    8 features (last_RD)               : 0.7108  Δ=-0.001 ✗ worsened
+#    9 features (month_cos)             : 0.7104  Δ=+0.001 ✓ trivial
+#   10 features (sum_FT)               : 0.7076  Δ=+0.003 ✓ marginal
+#   11 features (last_DrT)             : 0.7017  Δ=+0.006 ✓ BEST ← STOP
+#   12+ features: all worsen RMSE — clear elbow
+#
+# Features NOT selected (and why):
+#   mean_HL, mean_FT, mean_DrT  — segment averages outcompeted by
+#                                  totals (sum_DrT, sum_FT) and
+#                                  last-event values (last_DrT)
+#   mean_TW, mean_TD            — temperature averages not selected;
+#                                  DAR captures ambient conditions better
+#   DAT                         — daily ambient temperature at reset:
+#                                  worsened RMSE at step 16
+#   IRD_direction               — worsened RMSE at step 12
+#   n_events, max_FT, min_DrT   — consistently worsened after step 11
+#
+# Physical interpretation of final 11 features:
+#   month_sin              — primary seasonal signal (peak July);
+#                            recovery is seasonally driven
+#   prev_IRD_at_reset      — autocorrelation anchor: recovery is
+#                            strongly correlated with previous reset
+#   mean_ALPHA             — average drying fraction: more drying
+#                            relative to cycle time → better recovery
+#   total_LCT              — total flooding duration: proxy for
+#                            accumulated clogging severity before tillage
+#   DAR                    — daily ambient radiation at reset date:
+#                            photodegradation drives surface recovery
+#   prev_prev_IRD_at_reset — two-step history: recovery trajectory
+#                            not just most recent state
+#   sum_DrT                — cumulative drying time: total recovery
+#                            opportunity during the segment
+#   last_RD                — radiation in final drying event:
+#                            most proximal photodegradation signal
+#   month_cos              — orthogonal seasonal component
+#   sum_FT                 — total flooding load since reset:
+#                            cumulative clogging exposure
+#   last_DrT               — final drying duration before tillage:
+#                            recovery window immediately before reset
+
+MODEL2_FEATURES = [
+    # ── Seasonality (selected first — dominant driver) ──────────────────────
+    "month_sin",               # primary seasonal signal
+    "month_cos",               # orthogonal seasonal component
+
+    # ── Cross-segment history (autocorrelation) ─────────────────────────────
+    "prev_IRD_at_reset",       # previous reset level
+    "prev_prev_IRD_at_reset",  # two-step history (1.1% NaN — expected)
+
+    # ── Segment operational summary ─────────────────────────────────────────
+    "mean_ALPHA",              # average drying fraction
+    "total_LCT",               # total flooding duration
+    "sum_DrT",                 # cumulative drying time
+    "sum_FT",                  # cumulative flooding load
+
+    # ── Last-event features (most proximal signals) ─────────────────────────
+    "last_DrT",                # final drying duration before tillage
+    "last_RD",                 # final radiation during drying
+
+    # ── Ambient conditions at reset ─────────────────────────────────────────
+    "DAR",                     # daily ambient radiation at reset date
 ]
 
-# Cross-segment history (computed in build_dataset.py before quality filter)
-# prev_IRD_at_reset is the denominator for the log-ratio target and also
-# serves as the primary autocorrelation feature.
-MODEL2_HISTORY_FEATURES = [
-    "prev_IRD_at_reset",       # IRD_at_reset of reset i-1 — denominator + autocorrelation
-    "prev_prev_IRD_at_reset",  # IRD_at_reset of reset i-2 — two-step memory
-    "IRD_direction",           # (IRD[i-1] - IRD[i-2]) / dt — recovery trend (cm/h/day)
-]
-
-# Seasonality at the reset date + daily ambient conditions
-# month_sin ranks high in Model 2 feature importance — summer resets
-# recover better than winter resets.
-# DAT and DAR provide continuous ambient signal at the reset moment.
-MODEL2_SEASON_FEATURES = [
-    "month_sin",   # sin encoding — peak July (+1.0), trough January (-1.0)
-    "month_cos",   # cos encoding — orthogonal component
-    "DAT",         # daily avg temperature at reset moment — continuous seasonality
-    "DAR",         # daily avg radiation at reset moment — continuous seasonality
-]
-
-# Final combined feature list for Model 2
-MODEL2_FEATURES = (
-    MODEL2_SEGMENT_FEATURES +
-    MODEL2_HISTORY_FEATURES +
-    MODEL2_SEASON_FEATURES
-)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Columns needed from DuckDB to build the event dataset
