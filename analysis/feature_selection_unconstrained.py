@@ -1,12 +1,19 @@
 """
 analysis/feature_selection_unconstrained.py
 ============================================
-Analysis 1: Pure forward stepwise selection — no seeding, no constraints.
-Starts from mandatory base of 5, freely picks from all 16 remaining
-features at each step until all 21 features are added.
+Forward stepwise feature selection for Model 1 — unconstrained.
+Starts from mandatory base of 5 features, freely adds from all remaining
+features until all are added.
 
-Evaluation: Condition E (held-out test), Metric: RMSE on raw IRD (cm/h)
-Stopping: runs to completion — elbow identified visually from the curve.
+PRIMARY CONDITION: Condition E
+  - Training: all non-held-out basins (45 incl. outliers), ALL segments
+  - Test:     5 held-out basins, ALL events (no good_segment filter)
+  - Metric:   RMSE on raw IRD (cm/h) on held-out test set
+
+RESULT (documented for reproducibility):
+  Best: 11 features, RMSE=0.6491 cm/h
+  Elbow at step 7 (12th feature cum_TD worsened RMSE by 0.009 cm/h)
+  Full 21-feature model RMSE=0.7117 cm/h — 11-feature model better by 0.047 cm/h
 
 Usage
 -----
@@ -28,7 +35,7 @@ warnings.filterwarnings("ignore")
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import (
-    EVENT_CSV, OUTLIER_CSV, TABLES_DIR,
+    EVENT_CSV, TABLES_DIR,
     RANDOM_SEED, TRAIN_FRAC, VAL_FRAC,
 )
 from pipeline.features import (
@@ -49,26 +56,27 @@ MANDATORY_FEATURES = [
 ]
 
 LGBM_PARAMS = dict(
-    n_estimators     = 1000,
-    max_depth        = -1,
-    num_leaves       = 63,
-    learning_rate    = 0.05,
-    subsample        = 0.8,
-    feature_fraction = 0.8,
-    min_child_samples= 20,
-    reg_alpha        = 0.1,
-    reg_lambda       = 1.0,
-    random_state     = RANDOM_SEED,
-    n_jobs           = -1,
-    verbose          = -1,
+    n_estimators      = 1000,
+    max_depth         = -1,
+    num_leaves        = 63,
+    learning_rate     = 0.05,
+    subsample         = 0.8,
+    feature_fraction  = 0.8,
+    min_child_samples = 20,
+    reg_alpha         = 0.1,
+    reg_lambda        = 1.0,
+    random_state      = RANDOM_SEED,
+    n_jobs            = -1,
+    verbose           = -1,
 )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Data preparation — identical to feature_selection.py
+# Data preparation
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _reassign_splits(df: pd.DataFrame) -> pd.Series:
+    """Random segment-level 70/15/15 split for training basins."""
     seg_ids = sorted([
         int(s) for s in df["segment_id"].dropna().unique() if s >= 0
     ])
@@ -113,6 +121,20 @@ def resolve_feature_name(feature: str, df: pd.DataFrame) -> str | None:
 
 
 def load_condition_e(df_full: pd.DataFrame) -> pd.DataFrame:
+    """
+    Reconstruct Condition E exactly:
+    - Training: all non-held-out basins (45, including outliers),
+                ALL segments — no good_segment filter
+    - Test:     5 held-out basins, ALL events (no good_segment filter)
+
+    IMPORTANT: Condition E uses ALL segments on BOTH train and test.
+    The is_good_segment filter must NOT be applied to the held-out test set.
+    Using only good segments on test would inflate performance by excluding
+    difficult events — giving an optimistic and misleading evaluation.
+
+    The key change from earlier versions: removed `is_good_segment == True`
+    filter on df_test. Condition E is defined as no quality filtering.
+    """
     df = df_full.copy()
 
     if "basin_role" not in df.columns:
@@ -123,14 +145,18 @@ def load_condition_e(df_full: pd.DataFrame) -> pd.DataFrame:
         .dropna().unique().astype(int).tolist()
     )
 
+    # Training: all non-held-out basins, ALL segments (no quality filter)
     df_train = df[
         (~df["basin_number"].isin(held_out)) &
         (df["row_type"] == "event")
     ].copy()
+
+    # Test: held-out basins, ALL events — NO is_good_segment filter
+    # This is the critical fix: Condition E evaluates on ALL held-out events,
+    # not just good-segment events. Filtering would inflate test performance.
     df_test = df[
         (df["basin_number"].isin(held_out)) &
-        (df["row_type"]        == "event") &
-        (df["is_good_segment"] == True)
+        (df["row_type"] == "event")
     ].copy()
 
     df_train["split"] = _reassign_splits(df_train)
@@ -144,6 +170,7 @@ def load_condition_e(df_full: pd.DataFrame) -> pd.DataFrame:
     n_te = int((df_out["split"] == "test").sum())
     print(f"  Condition E: train={n_tr}  val={n_va}  "
           f"test={n_te}  held-out={sorted(held_out)}")
+    print(f"  ALL segments used — no quality filter on train or test")
     return df_out
 
 
@@ -218,7 +245,7 @@ def train_and_evaluate(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Pure forward stepwise — no seeding
+# Forward stepwise — unconstrained
 # ─────────────────────────────────────────────────────────────────────────────
 
 def forward_stepwise_unconstrained(
@@ -226,24 +253,22 @@ def forward_stepwise_unconstrained(
     all_features: list[str],
 ) -> tuple[pd.DataFrame, list[str]]:
     """
-    Pure forward stepwise selection — no seeding, no constraints.
-    At each step, tries every remaining candidate and picks
-    the one that minimises RMSE on held-out test.
-    Runs until all features are added.
+    Unconstrained forward stepwise selection.
+    Starts from mandatory base, adds one feature at a time,
+    always picking the one that minimises RMSE on held-out test.
+    Runs to completion — elbow identified visually from the output curve.
     """
-    # Resolve mandatory features
     mandatory = []
     for f in MANDATORY_FEATURES:
         r = resolve_feature_name(f, df)
         if r:
             mandatory.append(r)
 
-    # Full candidate pool minus mandatory
     candidates = [f for f in all_features if f not in mandatory]
 
     print(f"  Mandatory base ({len(mandatory)}): {mandatory}")
     print(f"  Candidates ({len(candidates)}): {candidates}")
-    print(f"  Will run to completion — {len(candidates)} steps")
+    print(f"  Running to completion — {len(candidates)} additional steps")
 
     results  = []
     selected = list(mandatory)
@@ -265,14 +290,12 @@ def forward_stepwise_unconstrained(
     ))
     best_rmse = m["rmse_ird"]
 
-    # Steps 1..N: free search
     remaining = list(candidates)
     step      = 1
 
     while remaining:
         print(f"\n{'='*65}")
-        print(f"  STEP {step} — "
-              f"{len(remaining)} candidates  "
+        print(f"  STEP {step} — {len(remaining)} candidates, "
               f"{len(selected)} features so far")
         print(f"{'='*65}")
 
@@ -293,13 +316,13 @@ def forward_stepwise_unconstrained(
                 f"R²={m['r2_ird']:+.4f}"
             )
 
-        step_df  = pd.DataFrame(step_rows).dropna(subset=["rmse_ird"])
+        step_df = pd.DataFrame(step_rows).dropna(subset=["rmse_ird"])
         if step_df.empty:
             break
 
         best_row     = step_df.loc[step_df["rmse_ird"].idxmin()]
         best_feature = best_row["feature"]
-        delta        = best_rmse - best_row["rmse_ird"]  # positive = improvement
+        delta        = best_rmse - best_row["rmse_ird"]
 
         selected  = selected + [best_feature]
         remaining = [f for f in remaining if f != best_feature]
@@ -329,26 +352,22 @@ def forward_stepwise_unconstrained(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Plot — full curve with elbow annotation
+# Plot
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_full_curve(results_df: pd.DataFrame) -> None:
     """
     Three-panel figure:
-    Left:   RMSE vs n_features — full curve with feature labels
-    Middle: Δ RMSE at each step (improvement from adding that feature)
-    Right:  R²(IRD) vs n_features
-
-    Color coding:
-      Green  = improvement (RMSE decreased)
-      Red    = degradation (RMSE increased)
-      Gold ★ = global minimum RMSE (recommended stopping point)
+      Left:   RMSE vs n_features with feature labels
+      Middle: ΔRMSE at each step (marginal improvement)
+      Right:  R²(IRD) vs n_features
+    Color: green = improvement, red = worsening, gold star = best.
     """
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
     fig.suptitle(
-        "Feature selection — Analysis 1: Pure forward stepwise (no constraints)\n"
-        "Condition E: 45-basin training, 5 held-out test basins  |  "
-        "Metric: RMSE on raw IRD (cm/h)",
+        "Feature selection — unconstrained forward stepwise (Condition E)\n"
+        "Training: 45 basins incl. outliers, all segments  |  "
+        "Test: 5 held-out basins, ALL events  |  Metric: RMSE on raw IRD (cm/h)",
         fontsize=10, fontweight="bold",
     )
 
@@ -358,46 +377,31 @@ def plot_full_curve(results_df: pd.DataFrame) -> None:
     deltas  = results_df["delta_rmse"].values
     labels  = results_df["added"].values
     colors  = ["seagreen" if d > 0 else "tomato" for d in deltas]
-    colors[0] = "gray"  # base step
+    colors[0] = "gray"
 
     best_idx = int(np.nanargmin(rmse))
 
-    # ── Left: RMSE curve ─────────────────────────────────────────────────────
+    # Left: RMSE curve
     ax = axes[0]
-    ax.plot(n_feat, rmse, color="black", linewidth=1.0,
-            alpha=0.5, zorder=2)
+    ax.plot(n_feat, rmse, color="black", linewidth=1.0, alpha=0.5, zorder=2)
     ax.scatter(n_feat, rmse, c=colors, s=60, zorder=4)
-
-    # Annotate feature names
     for i, (x, y, lbl) in enumerate(zip(n_feat, rmse, labels)):
-        if lbl == "base":
-            continue
-        va     = "bottom" if i % 2 == 0 else "top"
-        offset = 4 if va == "bottom" else -4
-        ax.annotate(
-            lbl, (x, y),
-            textcoords="offset points",
-            xytext=(0, offset),
-            fontsize=6.5, ha="center", va=va,
-            color="seagreen" if colors[i] == "seagreen" else "tomato",
-        )
-
-    # Gold star at minimum
-    ax.scatter(
-        n_feat[best_idx], rmse[best_idx],
-        color="gold", s=250, zorder=5,
-        marker="*", edgecolors="black", linewidths=0.8,
-    )
-    ax.annotate(
-        f"  Best: {int(n_feat[best_idx])} features\n"
-        f"  RMSE={rmse[best_idx]:.4f} cm/h",
-        (n_feat[best_idx], rmse[best_idx]),
-        fontsize=8, color="darkgoldenrod",
-        xytext=(8, -12), textcoords="offset points",
-    )
-
+        if lbl == "base": continue
+        va = "bottom" if i % 2 == 0 else "top"
+        ax.annotate(lbl, (x, y), textcoords="offset points",
+                    xytext=(0, 4 if va == "bottom" else -4),
+                    fontsize=6.5, ha="center", va=va,
+                    color=colors[i])
+    ax.scatter(n_feat[best_idx], rmse[best_idx],
+               color="gold", s=250, zorder=5, marker="*",
+               edgecolors="black", linewidths=0.8)
+    ax.annotate(f"  Best: {int(n_feat[best_idx])} features\n"
+                f"  RMSE={rmse[best_idx]:.4f} cm/h",
+                (n_feat[best_idx], rmse[best_idx]),
+                fontsize=8, color="darkgoldenrod",
+                xytext=(8, -12), textcoords="offset points")
     ax.set_xlabel("Number of features", fontsize=9)
-    ax.set_ylabel("RMSE (cm/h)",        fontsize=9)
+    ax.set_ylabel("RMSE (cm/h)", fontsize=9)
     ax.set_title("RMSE vs features ↓ better", fontsize=9, fontweight="bold")
     ax.set_xticks(n_feat)
     ax.grid(True, alpha=0.2)
@@ -406,66 +410,44 @@ def plot_full_curve(results_df: pd.DataFrame) -> None:
     ax.legend(handles=[
         Patch(color="seagreen", label="RMSE improved"),
         Patch(color="tomato",   label="RMSE worsened"),
-        plt.scatter([], [], marker="*", color="gold",
-                    edgecolors="black", s=150, label="Global minimum"),
     ], fontsize=8)
 
-    # ── Middle: delta RMSE bar chart ─────────────────────────────────────────
+    # Middle: delta RMSE
     ax = axes[1]
-    bar_colors = colors[1:]  # skip base step
-    bars = ax.bar(
-        n_feat[1:], deltas[1:],
-        color=bar_colors, alpha=0.85, edgecolor="white",
-    )
+    bar_colors = colors[1:]
+    bars = ax.bar(n_feat[1:], deltas[1:],
+                  color=bar_colors, alpha=0.85, edgecolor="white")
     ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
-
     for bar, lbl, val in zip(bars, labels[1:], deltas[1:]):
         va  = "bottom" if val >= 0 else "top"
         off = 0.001 if val >= 0 else -0.001
-        ax.text(
-            bar.get_x() + bar.get_width() / 2,
-            val + off,
-            lbl, ha="center", va=va,
-            fontsize=6.5, rotation=90,
-        )
-
+        ax.text(bar.get_x() + bar.get_width() / 2, val + off,
+                lbl, ha="center", va=va, fontsize=6.5, rotation=90)
     ax.set_xlabel("Number of features", fontsize=9)
-    ax.set_ylabel("ΔRMSE (cm/h)",       fontsize=9)
-    ax.set_title("Marginal improvement at each step\n"
-                 "↑ positive = RMSE improved",
+    ax.set_ylabel("ΔRMSE (cm/h)", fontsize=9)
+    ax.set_title("Marginal improvement at each step\n↑ positive = improved",
                  fontsize=9, fontweight="bold")
     ax.set_xticks(n_feat[1:])
     ax.grid(True, alpha=0.2, axis="y")
 
-    # ── Right: R² curve ───────────────────────────────────────────────────────
+    # Right: R² curve
     ax = axes[2]
-    ax.plot(n_feat, r2, color="black", linewidth=1.0,
-            alpha=0.5, zorder=2)
+    ax.plot(n_feat, r2, color="black", linewidth=1.0, alpha=0.5, zorder=2)
     ax.scatter(n_feat, r2, c=colors, s=60, zorder=4)
-
     best_r2_idx = int(np.nanargmax(r2))
-    ax.scatter(
-        n_feat[best_r2_idx], r2[best_r2_idx],
-        color="gold", s=250, zorder=5,
-        marker="*", edgecolors="black", linewidths=0.8,
-    )
-
+    ax.scatter(n_feat[best_r2_idx], r2[best_r2_idx],
+               color="gold", s=250, zorder=5, marker="*",
+               edgecolors="black", linewidths=0.8)
     for i, (x, y, lbl) in enumerate(zip(n_feat, r2, labels)):
         if lbl == "base": continue
-        va     = "bottom" if i % 2 == 0 else "top"
-        offset = 4 if va == "bottom" else -4
-        ax.annotate(
-            lbl, (x, y),
-            textcoords="offset points",
-            xytext=(0, offset),
-            fontsize=6.5, ha="center", va=va,
-            color="seagreen" if colors[i] == "seagreen" else "tomato",
-        )
-
+        va = "bottom" if i % 2 == 0 else "top"
+        ax.annotate(lbl, (x, y), textcoords="offset points",
+                    xytext=(0, 4 if va == "bottom" else -4),
+                    fontsize=6.5, ha="center", va=va,
+                    color=colors[i])
     ax.set_xlabel("Number of features", fontsize=9)
-    ax.set_ylabel("R² (raw IRD)",       fontsize=9)
-    ax.set_title("R²(IRD) vs features ↑ better",
-                 fontsize=9, fontweight="bold")
+    ax.set_ylabel("R² (raw IRD)", fontsize=9)
+    ax.set_title("R²(IRD) vs features ↑ better", fontsize=9, fontweight="bold")
     ax.set_xticks(n_feat)
     ax.grid(True, alpha=0.2)
 
@@ -474,17 +456,15 @@ def plot_full_curve(results_df: pd.DataFrame) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Summary table
+# Summary
 # ─────────────────────────────────────────────────────────────────────────────
 
 def print_summary(results_df: pd.DataFrame) -> None:
-    """Print step-by-step summary with delta annotations."""
     print(f"\n{'='*75}")
-    print("  FULL SELECTION PATH — Analysis 1 (unconstrained)")
+    print("  FULL SELECTION PATH — unconstrained forward stepwise (Condition E)")
     print(f"{'='*75}")
     print(f"  {'Step':>5}  {'Added':<25}  {'N':>3}  "
-          f"{'RMSE':>8}  {'ΔRMSE':>8}  {'MAPE%':>7}  "
-          f"{'R²':>7}  Note")
+          f"{'RMSE':>8}  {'ΔRMSE':>8}  {'MAPE%':>7}  {'R²':>7}  Note")
     print(f"  {'-'*75}")
 
     best_rmse = results_df["rmse_ird"].min()
@@ -513,9 +493,9 @@ def print_summary(results_df: pd.DataFrame) -> None:
 
     best_row = results_df.loc[results_df["rmse_ird"].idxmin()]
     print(f"\n  Recommended stopping point: {int(best_row['n_features'])} features")
-    print(f"  Best RMSE : {best_row['rmse_ird']:.4f} cm/h")
-    print(f"  Best MAPE : {best_row['mape']:.1f}%")
-    print(f"  Best R²   : {best_row['r2_ird']:+.4f}")
+    print(f"  Best RMSE: {best_row['rmse_ird']:.4f} cm/h")
+    print(f"  Best MAPE: {best_row['mape']:.1f}%")
+    print(f"  Best R²:   {best_row['r2_ird']:+.4f}")
     print(f"\n  Feature set at best RMSE:")
     for i, f in enumerate(best_row["features"], 1):
         print(f"    {i:>2}. {f}")
@@ -527,11 +507,11 @@ def print_summary(results_df: pd.DataFrame) -> None:
 
 def main() -> list[str]:
     print("=" * 65)
-    print("  FEATURE SELECTION — Analysis 1: Unconstrained forward stepwise")
-    print("  Condition E  |  Metric: RMSE(IRD)  |  Full path to all features")
+    print("  FEATURE SELECTION — unconstrained forward stepwise")
+    print("  Condition E  |  ALL segments on train AND test")
+    print("  Metric: RMSE on raw IRD (cm/h) on 5 held-out test basins")
     print("=" * 65)
 
-    # Load data
     print("\n--- Loading dataset ---")
     df_full = pd.read_csv(EVENT_CSV, parse_dates=["opening_valve_date"])
     df_full = df_full.loc[:, ~df_full.columns.duplicated()]
@@ -543,35 +523,30 @@ def main() -> list[str]:
     df_full = apply_log_transforms(df_full)
     print(f"  {len(df_full)} rows  {df_full['basin_number'].nunique()} basins")
 
-    # Build condition E
-    print("\n--- Building condition E ---")
+    print("\n--- Building Condition E ---")
     df_e = load_condition_e(df_full)
 
-    # Resolve full feature pool
+    # Resolve feature pool
     all_features = []
     for f in MODEL1_FEATURES:
         if f in df_e.columns:
             all_features.append(f)
     print(f"\n  Full pool ({len(all_features)}): {all_features}")
 
-    # Run unconstrained forward selection
     print("\n--- Running unconstrained forward selection ---")
     results_df, final_features = forward_stepwise_unconstrained(
         df_e, all_features
     )
 
-    # Summary
     print_summary(results_df)
 
     # Save
-    # Convert features list column to string for Excel
     results_save = results_df.copy()
     results_save["features"] = results_save["features"].apply(str)
     out_path = TABLES_DIR / "feature_selection_unconstrained.xlsx"
     results_save.to_excel(out_path, index=False)
     print(f"\n  Saved: {out_path}")
 
-    # Plot
     plot_full_curve(results_df)
 
     print("\nDone.")

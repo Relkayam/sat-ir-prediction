@@ -6,71 +6,67 @@ build_dataset.py. Each row aggregates operational and weather features
 from the segment that just ended (segment i-1), and records the target
 IRD_norm_log_reset of the next segment (segment i).
 
+PRIMARY CONDITION: Condition E (Held-out E)
+  - Training: 45 non-held-out basins including outliers, all resets
+  - Test: 5 held-out basins — all resets used as test (never seen in training)
+  - Result: R²=+0.884, RMSE=0.983 cm/h, MAPE=14.8% (n=454 resets)
+
 Target
 ------
   IRD_norm_log_reset = log(IRD_at_reset[i] / IRD_at_reset[i-1])
 
   Dimensionless log-ratio between consecutive reset values.
     = 0   : recovery exactly matches the previous reset
-    > 0   : better recovery than last time
+    > 0   : better recovery than last time (more positive = more recovery)
     < 0   : worse recovery than last time
 
   Physical rationale for log-ratio normalization:
     Different basins have fundamentally different hydraulic conductivity
-    ceilings (Ks). Basin A may max out at 4 cm/h while basin B maxes out
-    at 10 cm/h. Training on raw IRD_at_reset means the model partially
-    learns "which basin is this" rather than "how well did this basin
-    recover relative to its own potential."
+    ceilings (Ks). Basin 5201 averages 6.3 cm/h while Basin 4104 averages
+    1.7 cm/h — a nearly 4× difference. Training on raw IRD_at_reset means
+    the model learns basin identity rather than recovery dynamics.
 
     The log-ratio removes between-basin scale differences and expresses
     recovery relative to the basin's own recent history — consistent with
     Model 1 which also uses a log-ratio target (IRD_norm_log).
 
-    Raw IRD_at_reset was tested and rejected: LogPrevRatio gives better
-    MAPE (16.8% vs 21.0%) and is more physically interpretable across
-    the heterogeneous basin system (see normalization_analysis.py).
+    Raw IRD_at_reset was tested and rejected: log-ratio gives better
+    MAPE (16.8% vs 21.0%) and is more physically interpretable.
 
   Back-transform:
     IRD_at_reset[i] = IRD_at_reset[i-1] * exp(IRD_norm_log_reset)
 
   First reset per basin: no previous reset -> NaN -> excluded from training.
 
-Physical rationale
-------------------
-Model 2 answers: "Given how this segment was operated, what IRD_norm_log_reset
-will the basin achieve after the next reset/tillage?"
-
-The log-ratio target measures recovery relative to the previous reset,
-capturing the operational and environmental factors that drive improvement
-or degradation in basin performance over consecutive segments.
-
-Cross-segment history features (prev_IRD_at_reset, IRD_direction) are
-carried forward from event_dataset.csv where they were computed BEFORE
-the quality filter — ensuring the chronological sequence is preserved.
-prev_IRD_at_reset serves both as a feature AND as the back-transform
-denominator.
-
 Split strategies
 ----------------
-Two splits are computed and stored as separate columns:
+Three splits computed and stored as separate columns:
 
-  split_chrono — chronological per basin: first 70% -> train,
-                 next 15% -> val, last 15% -> test.
-                 Realistic for operational planning: model is trained
-                 on the past and tested on the future.
+  split_chrono  — chronological per basin: first 70% train, next 15% val,
+                  last 15% test. Primary within-sample evaluation.
+                  Honest forward-looking test (no future leakage).
 
-  split_random — random per basin (seed=42): same fractions, shuffled.
-                 Used for comparison only — chrono is the primary split.
+  split_random  — random per basin (seed=42). Same fractions, shuffled.
+                  Used for comparison only — chrono is primary.
 
-Why chronological?
-  IRD_at_reset is autocorrelated. A random split leaks future information
-  into training, artificially inflating performance. Chronological split
-  gives an honest forward-looking test.
+  split_held_out — Condition D/E evaluation:
+                   held_out basins  → 'held_out_test' (all resets used as test)
+                   outlier basins   → 'excluded' (Condition D)
+                                      reassigned to chrono for Condition E
+                   clean basins     → same as split_chrono
 
-Seasonality encoding
---------------------
-  month_sin = sin(2*pi*(month - 4) / 12)  — peak July (+1.0)
-  month_cos = cos(2*pi*(month - 4) / 12)  — orthogonal component
+  Condition E fix (applied at runtime in model2_reset.py):
+    outlier_mask = (df["basin_role"]=="outlier") & (df["split_held_out"]=="excluded")
+    df.loc[outlier_mask, "split_held_out"] = df.loc[outlier_mask, "split_chrono"]
+
+Baseline
+--------
+  Naive baseline: predict no change from previous reset (δ = 0)
+    Equivalent to: IRD_at_reset[i] = IRD_at_reset[i-1]
+    Held-out E pooled: R²=+0.867, RMSE=1.053 cm/h, MAPE=12.9%
+    Model 2 improvement: ΔRMSE = -0.070 cm/h (6.6%)
+    Note: naive MAPE < model MAPE — MAPE paradox explained in paper Discussion.
+    RMSE is the primary metric for Model 2.
 
 Usage
 -----
@@ -104,6 +100,8 @@ def _load_outlier_basins() -> set[int]:
     """Load outlier_basins.csv. Returns empty set if not found."""
     from config import OUTLIER_CSV
     if not OUTLIER_CSV.exists():
+        print("  WARNING: outlier_basins.csv not found — no outlier exclusions.")
+        print("  Run: python -m analysis.basin_analysis")
         return set()
     excluded = set()
     with open(OUTLIER_CSV) as f:
@@ -118,7 +116,6 @@ def _load_outlier_basins() -> set[int]:
     return excluded
 
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Seasonality encoding
 # ─────────────────────────────────────────────────────────────────────────────
@@ -128,6 +125,7 @@ def _month_encoding(month: int) -> tuple[float, float]:
     Circular encoding of calendar month.
     Peak at July (month=7): month_sin = +1.0
     Trough at January (month=1): month_sin = -1.0
+    Phase = 4: sin(2π(month-4)/12)
     """
     sin_val = float(np.sin(2 * np.pi * (month - SEASON_PHASE) / 12))
     cos_val = float(np.cos(2 * np.pi * (month - SEASON_PHASE) / 12))
@@ -139,30 +137,20 @@ def _month_encoding(month: int) -> tuple[float, float]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_basin_resets(
-    bn:             int,
-    bdf:            pd.DataFrame,
-    held_out_set:   set[int],
-    outlier_set:    set[int],
+    bn:           int,
+    bdf:          pd.DataFrame,
+    held_out_set: set[int],
+    outlier_set:  set[int],
 ) -> list[dict]:
     """
     Build one row per reset event for a single basin.
+
+    All segments are used (good and bad) to preserve chronological sequence.
+    Using only good segments would create gaps in the history.
+
+    First reset per basin: no previous reset → target=NaN → excluded.
     Tags each row with basin_role: 'held_out', 'outlier', or 'clean'.
-
-        Build one row per reset event for a single basin.
-
-    For each reset event (segment i):
-      - Target:   IRD_norm_log_reset = log(IRD_at_reset[i] / IRD_at_reset[i-1])
-      - Features: aggregated from segment i-1 events
-      - History:  prev_IRD_at_reset, IRD_direction from event_dataset.csv
-
-    All segments are used (good and bad) to preserve chronological order.
-    Using only good segments would create gaps in the history sequence.
-
-    First reset per basin: no previous reset -> target = NaN -> excluded.
-
-    Returns list of dicts (one per usable reset).
     """
-
     bdf = bdf.sort_values("opening_valve_date").reset_index(drop=True)
 
     reset_rows  = bdf[bdf["row_type"] == "reset"].copy()
@@ -171,7 +159,6 @@ def _build_basin_resets(
     if len(reset_rows) < 2 or len(all_seg_ids) < 2:
         return []
 
-    # Determine basin role
     if bn in held_out_set:
         basin_role = "held_out"
     elif bn in outlier_set:
@@ -187,7 +174,7 @@ def _build_basin_resets(
 
         sid_idx = all_seg_ids.index(sid)
         if sid_idx == 0:
-            continue
+            continue   # first segment — no previous reset
 
         prev_sid    = all_seg_ids[sid_idx - 1]
         prev_events = bdf[
@@ -205,37 +192,29 @@ def _build_basin_resets(
     return rows
 
 
-
 def _build_row(
-    bn: int,
-    reset_row: pd.Series,
+    bn:          int,
+    reset_row:   pd.Series,
     prev_events: pd.DataFrame,
     all_seg_ids: list[int],
 ) -> dict | None:
     """
     Build one reset-level feature row.
-
     Target: IRD_norm_log_reset = log(IRD_at_reset[i] / IRD_at_reset[i-1])
-    Returns None if target cannot be computed (missing/non-positive values).
-
-    The raw IRD_at_reset[i] is also stored for back-transform and reporting.
+    Returns None if target cannot be computed.
     """
-    # Current reset's IRD_at_reset (target numerator)
     ird_current = pd.to_numeric(
         reset_row.get("IRD_at_reset", np.nan), errors="coerce"
     )
-    # Previous reset's IRD_at_reset (denominator, also a feature)
     ird_prev = pd.to_numeric(
         reset_row.get("prev_IRD_at_reset", np.nan), errors="coerce"
     )
 
-    # Validate — both must be positive and finite for log-ratio
     if not (np.isfinite(ird_current) and ird_current > 0):
         return None
     if not (np.isfinite(ird_prev) and ird_prev > 0):
-        return None  # first reset per basin or missing prev
+        return None
 
-    # Compute log-ratio target
     ird_norm_log_reset = float(np.log(ird_current / ird_prev))
 
     def _agg(col: str, func: str) -> float:
@@ -253,7 +232,9 @@ def _build_row(
         val = pd.to_numeric(sorted_ev[col].iloc[-1], errors="coerce")
         return float(val) if np.isfinite(val) else np.nan
 
-    lct = pd.to_numeric(prev_events.get("LCT", pd.Series()), errors="coerce")
+    lct = pd.to_numeric(
+        prev_events.get("LCT", pd.Series(dtype=float)), errors="coerce"
+    )
 
     reset_month = pd.to_datetime(reset_row["opening_valve_date"]).month
     month_sin, month_cos = _month_encoding(reset_month)
@@ -267,14 +248,14 @@ def _build_row(
         "is_good_segment": bool(reset_row.get("is_good_segment", False)),
 
         # Target — log-ratio (dimensionless)
-        TARGET_M2:          ird_norm_log_reset,   # IRD_norm_log_reset
+        TARGET_M2:               ird_norm_log_reset,
 
-        # Raw IRD values stored for back-transform and reporting
-        # Back-transform: IRD_at_reset[i] = prev_IRD_at_reset * exp(TARGET_M2)
-        "IRD_at_reset":     float(ird_current),   # actual cm/h (for reporting)
-        "prev_IRD_at_reset_raw": float(ird_prev), # denominator for back-transform
+        # Raw IRD values for back-transform and reporting
+        # Back-transform: IRD_at_reset[i] = prev_IRD_at_reset_raw * exp(TARGET_M2)
+        "IRD_at_reset":          float(ird_current),
+        "prev_IRD_at_reset_raw": float(ird_prev),
 
-        # Aggregated segment i-1 features
+        # Segment i-1 operational summary
         "mean_DrT":   _agg("DrT",   "mean"),
         "mean_FT":    _agg("FT",    "mean"),
         "mean_ALPHA": _agg("ALPHA", "mean"),
@@ -298,22 +279,22 @@ def _build_row(
         "prev_prev_IRD_at_reset": _to_float(reset_row.get("prev_prev_IRD_at_reset")),
         "IRD_direction":          _to_float(reset_row.get("IRD_direction")),
 
-        # Seasonality at reset date
+        # Seasonality
         "month_sin": month_sin,
         "month_cos": month_cos,
 
-        # Daily ambient conditions at reset moment
+        # Ambient conditions at reset date
         "DAT": _to_float(reset_row.get("DAT")),
         "DAR": _to_float(reset_row.get("DAR")),
-        # Basin role — set in _build_basin_resets
-        "basin_role": "clean",  # placeholder, overwritten below
+
+        # Basin role — overwritten by _build_basin_resets
+        "basin_role": "clean",
     }
 
     return row
 
 
 def _to_float(val) -> float:
-    """Safely convert a value to float, returning NaN if not finite."""
     try:
         f = float(val)
         return f if np.isfinite(f) else np.nan
@@ -326,10 +307,7 @@ def _to_float(val) -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def add_chronological_split(reset_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Assign train/val/test splits chronologically per basin.
-    First 70% of resets -> train, next 15% -> val, last 15% -> test.
-    """
+    """Chronological 70/15/15 split per basin. Primary within-sample split."""
     reset_df = reset_df.copy()
     reset_df["split_chrono"] = "test"
 
@@ -342,12 +320,12 @@ def add_chronological_split(reset_df: pd.DataFrame) -> pd.DataFrame:
         reset_df.loc[bdf.index[n_tr:n_tr+n_va], "split_chrono"] = "val"
 
     counts = reset_df["split_chrono"].value_counts().to_dict()
-    print(f"  Chrono split : {counts}")
+    print(f"  Chrono split: {counts}")
     return reset_df
 
 
 def add_random_split(reset_df: pd.DataFrame) -> pd.DataFrame:
-    """Assign train/val/test splits randomly per basin (seed=42)."""
+    """Random 70/15/15 split per basin (seed=42). Comparison only."""
     reset_df = reset_df.copy()
     reset_df["split_random"] = "test"
     rng = np.random.default_rng(RANDOM_SEED)
@@ -361,30 +339,33 @@ def add_random_split(reset_df: pd.DataFrame) -> pd.DataFrame:
         reset_df.loc[idx[n_tr:n_tr+n_va], "split_random"] = "val"
 
     counts = reset_df["split_random"].value_counts().to_dict()
-    print(f"  Random split : {counts}")
+    print(f"  Random split: {counts}")
     return reset_df
-
 
 
 def add_held_out_split(reset_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Assign split_held_out column for held-out basin generalisation test.
+    Assign split_held_out for Condition D/E evaluation.
 
-    Logic (mirrors Model 1 condition D/E):
-      held_out basins  → all resets tagged 'held_out_test'
-                         (ALL resets used as test, not just last 15%)
-      outlier basins   → 'excluded'
-      clean basins     → same as split_chrono (train/val/test)
+    held_out basins  → 'held_out_test' (ALL resets used as test)
+    outlier basins   → 'excluded'  (reassigned to chrono for Condition E
+                                    at runtime in model2_reset.py)
+    clean basins     → same as split_chrono
 
-    Using ALL resets from held-out basins as test is necessary because
-    each held-out basin has only ~45 resets total. The last 15% (chrono)
-    would give only ~7 events per basin — too few for reliable metrics.
-    Using all resets gives ~45 × 5 = ~225 held-out test events.
+    Using ALL resets from held-out basins as test:
+    Each held-out basin has ~80 resets. Using only the last 15% (chrono)
+    gives ~12 events per basin — too few for reliable metrics.
+    Using all gives ~80 × 5 = ~400 held-out test events.
 
-    NOTE: held-out basins are NEVER in training.
+    Condition E fix (applied at runtime in model2_reset.py, NOT here):
+      outlier_mask = (
+          (df["basin_role"] == "outlier") &
+          (df["split_held_out"] == "excluded")
+      )
+      df.loc[outlier_mask, "split_held_out"] = df.loc[outlier_mask, "split_chrono"]
     """
     reset_df = reset_df.copy()
-    reset_df["split_held_out"] = reset_df["split_chrono"]  # default
+    reset_df["split_held_out"] = reset_df["split_chrono"]
 
     held_out_mask = reset_df["basin_role"] == "held_out"
     outlier_mask  = reset_df["basin_role"] == "outlier"
@@ -395,7 +376,10 @@ def add_held_out_split(reset_df: pd.DataFrame) -> pd.DataFrame:
     counts = reset_df["split_held_out"].value_counts().to_dict()
     print(f"  Held-out split: {counts}")
     n_ho = int(held_out_mask.sum())
-    print(f"  Held-out basins: {sorted(reset_df.loc[held_out_mask, 'basin_number'].unique().tolist())}  ({n_ho} resets → all used as test)")
+    ho_basins = sorted(
+        reset_df.loc[held_out_mask, "basin_number"].unique().tolist()
+    )
+    print(f"  Held-out basins: {ho_basins}  ({n_ho} resets → all used as test)")
     return reset_df
 
 
@@ -403,12 +387,10 @@ def add_held_out_split(reset_df: pd.DataFrame) -> pd.DataFrame:
 # Feature coverage report
 # ─────────────────────────────────────────────────────────────────────────────
 
-
-
 def print_feature_coverage(reset_df: pd.DataFrame) -> None:
-    """Print NaN coverage for each Model 2 feature."""
+    """Print NaN rate for each Model 2 feature."""
     print("\n  Feature coverage (NaN check):")
-    print(f"  {'Feature':<30} {'NaN':>6}  {'%':>6}  {'Status'}")
+    print(f"  {'Feature':<30} {'NaN':>6}  {'%':>6}  Status")
     print(f"  {'-'*55}")
     for feat in MODEL2_FEATURES:
         if feat not in reset_df.columns:
@@ -416,7 +398,7 @@ def print_feature_coverage(reset_df: pd.DataFrame) -> None:
             continue
         n_nan = int(reset_df[feat].isna().sum())
         pct   = 100.0 * n_nan / len(reset_df)
-        flag  = "  WARNING HIGH" if pct > 20 else ""
+        flag  = "  ⚠ HIGH" if pct > 20 else ""
         print(f"  {feat:<30} {n_nan:>6}  {pct:>5.1f}%{flag}")
 
 
@@ -429,6 +411,7 @@ def main() -> pd.DataFrame:
     print("=" * 65)
     print("  BUILD RESET DATASET — pipeline/build_reset_dataset.py")
     print(f"  Target: {TARGET_M2} = log(IRD_at_reset[i] / IRD_at_reset[i-1])")
+    print(f"  Primary condition: Held-out E")
     print("=" * 65)
 
     if not EVENT_CSV.exists():
@@ -439,22 +422,18 @@ def main() -> pd.DataFrame:
 
     df = pd.read_csv(EVENT_CSV, parse_dates=["opening_valve_date"])
     df = df.loc[:, ~df.columns.duplicated()]
-    print(f"  Event dataset : {len(df)} rows  |  "
-          f"{df['basin_number'].nunique()} basins")
+    print(f"  Event dataset: {len(df)} rows  |  {df['basin_number'].nunique()} basins")
 
-    # Load outlier and held-out basin sets
     held_out_set = set(HELD_OUT_BASIN_LIST)
     outlier_set  = _load_outlier_basins()
-    print(f"  Held-out basins : {sorted(held_out_set)}")
-    print(f"  Outlier basins  : {sorted(outlier_set)}")
+    print(f"  Held-out basins: {sorted(held_out_set)}")
+    print(f"  Outlier basins:  {sorted(outlier_set)}")
 
-    # Build reset rows per basin
+    # Build reset rows
     print("\n  Building reset rows per basin...")
     all_rows: list[dict] = []
     for bn, bdf in df.groupby("basin_number"):
-        rows = _build_basin_resets(
-            int(bn), bdf, held_out_set, outlier_set
-        )
+        rows = _build_basin_resets(int(bn), bdf, held_out_set, outlier_set)
         all_rows.extend(rows)
         if rows:
             role = rows[0].get("basin_role", "clean")
@@ -464,14 +443,10 @@ def main() -> pd.DataFrame:
         raise ValueError("No reset rows built — check event_dataset.csv.")
 
     reset_df = pd.DataFrame(all_rows).reset_index(drop=True)
-    print(f"\n  Reset dataset : {len(reset_df)} rows  |  "
+    print(f"\n  Reset dataset: {len(reset_df)} rows  |  "
           f"{reset_df['basin_number'].nunique()} basins")
-    print(f"  Avg resets/basin : "
-          f"{len(reset_df) / reset_df['basin_number'].nunique():.1f}")
-
-    # Role summary
-    role_counts = reset_df["basin_role"].value_counts().to_dict()
-    print(f"  Basin roles   : {role_counts}")
+    print(f"  Avg resets/basin: {len(reset_df) / reset_df['basin_number'].nunique():.1f}")
+    print(f"  Basin roles: {reset_df['basin_role'].value_counts().to_dict()}")
 
     # Add splits
     print()
@@ -482,20 +457,19 @@ def main() -> pd.DataFrame:
     # Feature coverage
     print_feature_coverage(reset_df)
 
-    # Target distribution summary
+    # Target distribution
     tgt = reset_df[TARGET_M2].dropna()
     print(f"\n  Target ({TARGET_M2}) distribution:")
     print(f"    mean={tgt.mean():.4f}  median={tgt.median():.4f}  "
           f"std={tgt.std():.4f}  min={tgt.min():.4f}  max={tgt.max():.4f}")
-    print(f"    Interpretation: mean~0 means recovery typically matches previous reset")
-    print(f"    Positive skew = some resets recover much better than previous")
+    print(f"    mean~0 → recovery typically matches previous reset")
 
     # Raw IRD_at_reset stats
-    raw_tgt = reset_df["IRD_at_reset"].dropna()
+    raw = reset_df["IRD_at_reset"].dropna()
     print(f"\n  Raw IRD_at_reset (cm/h):")
-    print(f"    mean={raw_tgt.mean():.2f}  median={raw_tgt.median():.2f}  "
-          f"std={raw_tgt.std():.2f}  min={raw_tgt.min():.2f}  "
-          f"max={raw_tgt.max():.2f}")
+    print(f"    mean={raw.mean():.2f}  median={raw.median():.2f}  "
+          f"std={raw.std():.2f}  min={raw.min():.2f}  max={raw.max():.2f}")
+    print(f"    Range: {raw.max()/raw.min():.1f}× — motivates log-ratio normalization")
 
     # Naive baseline
     valid = (
@@ -506,46 +480,39 @@ def main() -> pd.DataFrame:
     )
     if valid.sum() > 10:
         from sklearn.metrics import r2_score
-
-        y_true_log  = reset_df.loc[valid, TARGET_M2].values
-        y_naive_log = np.zeros(valid.sum())
-        r2_naive_log = r2_score(y_true_log, y_naive_log)
-
-        y_true_raw  = reset_df.loc[valid, "IRD_at_reset"].values
-        y_naive_raw = reset_df.loc[valid, "prev_IRD_at_reset_raw"].values
+        y_true_log   = reset_df.loc[valid, TARGET_M2].values
+        r2_naive_log = r2_score(y_true_log, np.zeros(valid.sum()))
+        y_true_raw   = reset_df.loc[valid, "IRD_at_reset"].values
+        y_naive_raw  = reset_df.loc[valid, "prev_IRD_at_reset_raw"].values
         finite = (
             np.isfinite(y_true_raw) & np.isfinite(y_naive_raw) &
             (y_true_raw > 0) & (y_naive_raw > 0)
         )
         r2_naive_raw = r2_score(y_true_raw[finite], y_naive_raw[finite])
-
-        print(f"\n  Naive baseline (predict log-ratio = 0):")
-        print(f"    R² (log-ratio space) : {r2_naive_log:.3f}")
-        print(f"    R² (raw IRD cm/h)    : {r2_naive_raw:.3f}")
-        print(f"    → Model 2 must beat these thresholds to add value.")
+        print(f"\n  Naive baseline (predict δ = 0, no change from previous reset):")
+        print(f"    R² (log-ratio space): {r2_naive_log:.3f}")
+        print(f"    R² (raw IRD cm/h):    {r2_naive_raw:.3f}")
+        print(f"    Model 2 must beat RMSE (not R²) — see MAPE paradox in Discussion")
 
     # Held-out split summary
     print(f"\n  Held-out split summary:")
-    for split_val in ["train", "val", "test", "held_out_test", "excluded"]:
-        n = int((reset_df["split_held_out"] == split_val).sum())
+    for val in ["train", "val", "test", "held_out_test", "excluded"]:
+        n = int((reset_df["split_held_out"] == val).sum())
         if n > 0:
-            print(f"    {split_val:<15}: {n} resets")
+            print(f"    {val:<15}: {n} resets")
 
     # Per-field summary
     print(f"\n  Per-field reset counts:")
-    field_summary = reset_df.groupby(
-        ["field_name", "basin_role"]
-    )["basin_number"].count().reset_index()
-    field_summary.columns = ["field", "role", "n_resets"]
-    for _, row in field_summary.iterrows():
-        print(f"    {row['field']:<12}  {row['role']:<10}  {int(row['n_resets'])} resets")
+    summary = reset_df.groupby(["field_name", "basin_role"])["basin_number"].count()
+    for (field, role), n in summary.items():
+        print(f"    {field:<12}  {role:<10}  {int(n)} resets")
 
     # Save
     reset_df.to_csv(RESET_CSV, index=False)
     print(f"\n  Saved: {RESET_CSV}  ({len(reset_df)} rows)")
 
-    # Summary table per basin
-    summary = reset_df.groupby("basin_number").agg(
+    # Per-basin summary table
+    basin_summary = reset_df.groupby("basin_number").agg(
         n_resets       = (TARGET_M2,      "count"),
         mean_log_ratio = (TARGET_M2,      "mean"),
         std_log_ratio  = (TARGET_M2,      "std"),
@@ -554,14 +521,11 @@ def main() -> pd.DataFrame:
         basin_role     = ("basin_role",   "first"),
     ).reset_index()
     summary_path = TABLES_DIR / "reset_dataset_summary.xlsx"
-    summary.to_excel(summary_path, index=False)
+    basin_summary.to_excel(summary_path, index=False)
     print(f"  Saved: {summary_path.name}")
 
     return reset_df
 
-
-if __name__ == "__main__":
-    main()
 
 if __name__ == "__main__":
     main()

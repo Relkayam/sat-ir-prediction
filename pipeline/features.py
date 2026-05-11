@@ -1,71 +1,84 @@
 """
 pipeline/features.py — Feature definitions for Model 1 and Model 2
 ====================================================================
+Single source of truth for:
+  - Model targets (TARGET_M1, TARGET_M2)
+  - Feature lists for both models (final sets after forward stepwise selection)
+  - Log transforms (LOG_TRANSFORM)
+  - Feature preparation function (prepare_features)
 
-This file is the single source of truth for:
-  - Which raw columns are used as features in each model
-  - Which columns require log transformation (and why)
-  - The model targets
+PRIMARY EVALUATION CONDITION: Condition E
+  - Model 1: 45 non-held-out basins (including outliers), all segments,
+             tested on 5 completely unseen held-out basins
+             Pooled: R²=+0.898, RMSE=0.607 cm/h, MAPE=13.1% (n=4,386)
+  - Model 2: 45 non-held-out basins (including outliers), all resets,
+             tested on 5 completely unseen held-out basins
+             Pooled: R²=+0.884, RMSE=0.983 cm/h, MAPE=14.8% (n=454)
 
-Nothing here depends on data — these are just lists and mappings.
-Import from this file in build_dataset.py, model1_decay.py, model2_reset.py,
-and all figure scripts.
-
-─────────────────────────────────────────────────────────────────────────────
-Quick reference: feature naming conventions
-─────────────────────────────────────────────────────────────────────────────
-  prev_*     — value from the event immediately before the current one
-               (within the same segment)
-  cum_*      — cumulative sum since segment reset, up to but not including
-               the current event
-  mean_*     — segment-level mean (used in Model 2 reset dataset)
-  sum_*      — segment-level sum
-  last_*     — value from the final event of the segment (Model 2 only)
-  log1p_*    — log(1 + x) transform applied to a skewed column
+Import this file in:
+  build_dataset.py, build_reset_dataset.py,
+  model1_decay.py, model2_reset.py,
+  model_comparison.py, model2_comparison.py,
+  all figure scripts (fig2–fig6)
 
 ─────────────────────────────────────────────────────────────────────────────
-Operational features
+Feature naming conventions
 ─────────────────────────────────────────────────────────────────────────────
-  FT    Flooding Time (h)        — duration of active flooding phase
-  DT    Drainage Time (h)        — duration of passive drainage phase
-  DrT   Drying Time (h)          — duration between drainage end and next flood
-  WT    Wetting Time (h)         — FT + DT (total wet exposure)
-  Ct    Cycle Time (h)           — WT + DrT (full cycle duration)
-  ALPHA Drying fraction          — DrT / Ct — key recovery driver
-  HL    Hydraulic Load (cm)      — CIV / basin_area — water depth per event
-  IRD   Infiltration Rate (cm/h) — measured during drainage phase
-
-  NOTE on HL: HL is ENDOGENOUS — high HL occurs because IRD is high, not
-  the other way around. HL must NOT be varied in optimization/heatmap
-  analysis. It is fixed at the dataset median there.
+  prev_*     value from the immediately preceding event (within segment)
+  cum_*      cumulative sum since segment reset (up to but not including
+             the current event)
+  mean_*     segment-level mean (Model 2 reset dataset)
+  sum_*      segment-level sum (Model 2 reset dataset)
+  last_*     value from the final event of the segment (Model 2 only)
+  log1p_*    log(1 + x) transform applied to a skewed column
 
 ─────────────────────────────────────────────────────────────────────────────
-Weather features
+Operational variables
 ─────────────────────────────────────────────────────────────────────────────
-  TD  Temperature Dry (°C)       — ambient temp during drying window
-  TW  Temperature Wet (°C)       — ambient temp during wetting window
-  RD  Radiation Dry (W/m²)       — solar radiation during drying window
-  RW  Radiation Wet (W/m²)       — solar radiation during wetting window
-  AL  Water Level (cm)           — measured water level in basin
-  ML  Max Water Level (cm)
-  AF  Area Flooded (m²)
-  DAT Daily Average Temperature  — continuous seasonality signal
-  DAR Daily Average Radiation    — continuous seasonality + photodegradation
+  FT    Flooding Time (h)         duration of active flooding phase
+  DT    Drainage Time (h)         duration of passive drainage phase
+  DrT   Drying Time (h)           duration between drainage end and next flood
+  WT    Wetting Time (h)          FT + DT
+  Ct    Cycle Time (h)            WT + DrT
+  ALPHA Drying fraction           DrT / Ct — primary operational recovery driver
+  HL    Hydraulic Load (cm)       CIV / basin_area — water depth per event
+  IRD   Infiltration Rate (cm/h)  measured during drainage phase
 
-  NOTE on RD: radiation during drying is more physically meaningful than
-  drying time alone — photodegradation of the clogging layer is the
-  primary mechanism of natural surface recovery. RD outranks DrT in SHAP.
+  NOTE on HL: HL is ENDOGENOUS — high HL occurs because IRD is high,
+  not the reverse. Do not vary HL in optimization or heatmap analysis.
 
 ─────────────────────────────────────────────────────────────────────────────
-Why log1p transforms for HL
+Weather variables
 ─────────────────────────────────────────────────────────────────────────────
-  prev_HL  skewness=15.5, kurtosis=574 — extreme right tail
-  cum_HL   similar distribution
+  TD   Temperature during drying (°C)
+  TW   Temperature during wetting (°C)
+  RD   Radiation during drying (W/m²)     primary photodegradation signal
+  RW   Radiation during wetting (W/m²)
+  DAT  Daily Average Temperature at event date
+  DAR  Daily Average Radiation at event date — key Model 2 driver
 
-  log1p(x) = log(1+x): safe for near-zero values, compresses the tail,
-  dramatically improves gradient boosting split quality on this feature.
-  The raw columns are kept in the CSV; log1p versions are computed at
-  runtime in prepare_features().
+─────────────────────────────────────────────────────────────────────────────
+SHAP findings (Condition E) — for reference
+─────────────────────────────────────────────────────────────────────────────
+  Model 1 top 4 (stable across conditions A, D, E):
+    1. IRD_at_reset    mean|SHAP|=0.183  scale anchor
+    2. prev_ALPHA      mean|SHAP|=0.178  drying fraction → less decay
+    3. prev_DrT        mean|SHAP|=0.108  see collinearity note below
+    4. log1p_prev_HL   mean|SHAP|=0.081  hydraulic load → more clogging
+
+  prev_DrT collinearity note (IMPORTANT):
+    SHAP shows high prev_DrT → faster decay (apparent contradiction).
+    This is a collinearity artifact: Spearman r(prev_DrT, prev_ALPHA) = 0.79.
+    After controlling for ALPHA, residual DrT variation correlates with
+    long-cycle events that are operationally difficult.
+    The unconditional correlation is physically correct:
+      Spearman r(prev_DrT, η) = +0.18 — longer drying → less decay.
+    Full collinearity analysis in Discussion + SI of paper.
+    Do NOT remove prev_DrT from the feature set.
+
+  Model 2 top 2 (stable across all conditions):
+    1. prev_IRD_at_reset    autocorrelation anchor
+    2. DAR                  daily radiation at tillage → till when sunny
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -73,314 +86,179 @@ Why log1p transforms for HL
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Model 1: within-segment IRD decay
-# log(IRD / IRD_at_reset) — starts at 0 at reset, goes negative as IRD decays
-# Predicting a log-ratio makes the target dimensionless and normalizes
-# across basins with very different absolute IRD scales.
+# η(t) = log(IRD(t) / IRD_at_reset)
+# Starts at 0 at segment reset, goes negative as clogging progresses.
+# Back-transform: IRD(t) = IRD_at_reset × exp(η(t))
 TARGET_M1 = "IRD_norm_log"
 
-# Model 2: IRD recovery after reset/tillage
-# log(IRD_at_reset[i] / IRD_at_reset[i-1])
-# Dimensionless log-ratio between consecutive reset values.
-# Starts at 0 when recovery exactly matches the previous reset.
-# Positive = better recovery than last time.
-# Negative = worse recovery than last time.
-#
-# This normalization is physically justified:
-#   - Different basins have different hydraulic conductivity ceilings (Ks)
-#   - Raw IRD_at_reset varies dramatically between basins (e.g. 2-12 cm/h)
-#   - The log-ratio removes between-basin scale differences and expresses
-#     recovery relative to the basin's own recent history
-#   - Consistent with Model 1 which also uses a log-ratio target
-#   - Back-transform: IRD_at_reset[i] = IRD_at_reset[i-1] * exp(predicted)
-#
-# Raw IRD_at_reset was tested and rejected: while R² appeared higher,
-# the model was partly learning which basin it was predicting rather than
-# the recovery dynamics. LogPrevRatio gives better MAPE (16.8% vs 21.0%)
-# and is more physically interpretable across the heterogeneous basin system.
-#
-# First reset per basin has no previous reset -> NaN -> excluded from training.
+# Model 2: post-tillage recovery
+# δᵢ = log(IRD_at_reset[i] / IRD_at_reset[i-1])
+# = 0  : recovery matches previous reset exactly
+# > 0  : better recovery than last time
+# < 0  : worse recovery than last time
+# Back-transform: IRD_at_reset[i] = IRD_at_reset[i-1] × exp(δᵢ)
+# First reset per basin: no previous reset → NaN → excluded from training.
 TARGET_M2 = "IRD_norm_log_reset"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Log transforms (applied in prepare_features)
+# Log transforms
 # ─────────────────────────────────────────────────────────────────────────────
-# Maps raw column name -> transformed column name.
-# prepare_features() adds the transformed column and substitutes it
-# in the feature list. The raw column is NOT removed from the DataFrame.
+# Maps raw column → transformed column name.
+# prepare_features() computes transformed columns and substitutes them
+# in the feature list. Raw columns are NOT removed from the DataFrame.
+#
+# Why log1p for HL?
+#   prev_HL: skewness=15.5, kurtosis=574 — extreme right tail
+#   log1p(x) = log(1+x): safe for near-zero values, compresses tail,
+#   dramatically improves gradient boosting split quality.
 LOG_TRANSFORM = {
     "prev_HL": "log1p_prev_HL",
     "cum_HL":  "log1p_cum_HL",
 }
 
 
-# Model 1 features (11 total after log transforms)
-# Final set selected by unconstrained forward stepwise on Condition E.
-# Elbow detected at step 7 (12th feature cum_TD worsened RMSE).
-# Full selection path: analysis/feature_selection_unconstrained.py
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Model 1 features — FINAL SET (11 features after log transforms)
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# Feature selection methodology (documented for reproducibility):
-# ---------------------------------------------------------------
-# Forward stepwise selection was performed on Condition E (45-basin training,
-# 5 held-out test basins never seen during training). Metric: RMSE on raw
-# IRD (cm/h) on held-out test set. LightGBM with well-established defaults.
-#
-# Starting set: 5 mandatory features (top SHAP across conditions A, D, E)
-# Selection: greedy forward, unconstrained, run to all 21 features
+# Selected by unconstrained forward stepwise selection on Condition E.
+# Metric: RMSE on raw IRD (cm/h) on 5 held-out test basins.
 # See: outputs/tables/feature_selection_unconstrained.xlsx
 #      analysis/feature_selection_unconstrained.py
 #
-# Selection path (RMSE at each step):
-#   5 features: 0.7193 cm/h  (mandatory base)
-#   6 features: 0.6936 cm/h  +prev_TD      Δ=+0.026 ✓ strong
-#   7 features: 0.6794 cm/h  +prev_FT      Δ=+0.014 ✓ strong
-#   8 features: 0.6679 cm/h  +cum_TW       Δ=+0.012 ✓ strong
-#   9 features: 0.6659 cm/h  +cum_FT       Δ=+0.002 ✓ marginal
-#  10 features: 0.6504 cm/h  +prev_RD      Δ=+0.016 ✓ strong
-#  11 features: 0.6491 cm/h  +prev_RW      Δ=+0.001 ✓ marginal (retained)
-#  12 features: 0.6582 cm/h  +cum_TD       Δ=-0.009 ✗ worsened → STOP
+# Selection path:
+#    5 features (base):  0.7193 cm/h  mandatory base
+#    6 features:         0.6936 cm/h  +prev_TD      Δ=+0.026 ✓ strong
+#    7 features:         0.6794 cm/h  +prev_FT      Δ=+0.014 ✓ strong
+#    8 features:         0.6679 cm/h  +cum_TW       Δ=+0.012 ✓ strong
+#    9 features:         0.6659 cm/h  +cum_FT       Δ=+0.002 ✓ marginal
+#   10 features:         0.6504 cm/h  +prev_RD      Δ=+0.016 ✓ strong
+#   11 features:         0.6491 cm/h  +prev_RW      Δ=+0.001 ✓ marginal
+#   12 features:         0.6582 cm/h  +cum_TD       Δ=-0.009 ✗ STOP → elbow
 #
-# Features NOT selected (and why):
-#   cum_RD, cum_RW  — cumulative radiation features: partially collinear
-#                     with prev_RD, prev_RW and cum_TW. The most proximal
-#                     radiation signal (prev_*) dominates over cumulative.
-#   cum_TD          — first feature to worsen RMSE (-0.009): defines elbow
-#   log1p_cum_HL    — only recovers after cum_TD noise; not independently useful
-#   prev_TW         — only useful after log1p_cum_HL compensates cum_TD noise
-#   cum_DrT         — worsened RMSE at step 10 (-0.006)
-#   event_count     — compensates for noise from earlier bad additions
-#   prev_AL, prev_ML, prev_AF — consistently worsen RMSE; water level
-#                               and flooded area features add noise not signal
-#
-# Previously tested full 21-feature set:
-#   Condition E RMSE = 0.7117 cm/h  (worse than 11-feature set)
-#   This confirms the 21-feature model was overfitting to training basin
-#   idiosyncrasies — the reduced set generalises better to unseen basins.
-#
-# Physical interpretation of final 11 features:
-#   IRD_at_reset    — scale anchor: basin hydraulic conductivity ceiling
-#   prev_ALPHA      — drying fraction: ratio of recovery time to cycle time
-#   log1p_prev_HL   — hydraulic load: clogging intensity of previous event
-#   prev_DrT        — drying duration: absolute recovery time
-#   LCT             — time since reset: primary decay axis
-#   prev_TD         — temperature during previous drying: affects viscosity
-#                     and biological activity during surface recovery
-#   prev_FT         — flooding time: duration of clogging exposure
-#   cum_TW          — cumulative wetting temperature since reset: encodes
-#                     seasonal signal and accumulated biological activity
-#   cum_FT          — cumulative flooding time: total clogging load since reset
-#   prev_RD         — radiation during previous drying: photodegradation
-#                     of clogging layer — most proximal environmental signal
-#   prev_RW         — radiation during previous wetting: solar exposure
-#                     during flooding influences surface biofilm activity
-
-
-# NOT included (tested and rejected by forward stepwise selection):
-#   cum_RD, cum_RW      — collinear with prev_RD/prev_RW and cum_TW
-#   cum_TD              — worsened RMSE at step 7 (elbow)
-#   log1p_cum_HL        — only useful after noise compensation
-#   prev_TW             — only useful after multiple noise features added
-#   cum_DrT             — worsened RMSE at step 10
-#   event_count         — compensates for noise; not independently useful
-#   prev_AL, prev_ML, prev_AF — water level/area: noise not signal
-#
-# Previously rejected (V1, not tested in V2 stepwise):
-#   prev_IRD_at_reset   — r=-0.07, dropna cost caused R² 0.397→0.308
-#   IRD_direction       — r=+0.005 (between-reset trend ≠ within-segment)
-#   month_sin/cos       — captured by cum_TW and prev_TD
-#   DAT, DAR            — commented out: redundant with prev_TD/prev_RD
+# Full 21-feature set RMSE = 0.7117 cm/h — worse than 11-feature set.
+# Confirms overfitting in larger model; reduced set generalises better.
 
 MODEL1_RAW_FEATURES = [
-    # ── Mandatory base (top SHAP, all conditions) ──────────────────────────
-    "IRD_at_reset",       # scale anchor — basin hydraulic conductivity
-    "prev_ALPHA",         # drying fraction = DrT / Ct
-    "prev_HL",            # -> log1p_prev_HL at runtime (skewness > 15)
-    "prev_DrT",           # drying time — absolute recovery duration
-    "LCT",                # time since reset — primary decay axis
+    # ── Mandatory base — top SHAP across all conditions ────────────────────
+    "IRD_at_reset",   # scale anchor — basin hydraulic conductivity ceiling
+    "prev_ALPHA",     # drying fraction = DrT/Ct — primary recovery driver
+    "prev_HL",        # → log1p_prev_HL at runtime (skewness=15.5)
+    "prev_DrT",       # drying time — absolute recovery duration
+                      # NOTE: SHAP direction appears counterintuitive due to
+                      # collinearity with prev_ALPHA (r=0.79). Unconditional
+                      # r(prev_DrT, η)=+0.18 confirms correct physical direction.
+                      # See Discussion + SI for full collinearity analysis.
+    "LCT",            # time since reset — primary decay axis
 
-    # ── Step 1-3: high-value additions (Δ > 0.010 cm/h each) ──────────────
-    "prev_TD",            # temperature during previous drying phase
-    "prev_FT",            # flooding time of previous event
-    "cum_TW",             # cumulative wetting temperature since reset
+    # ── High-value additions (Δ > 0.010 cm/h each) ────────────────────────
+    "prev_TD",        # temperature during previous drying phase
+    "prev_FT",        # flooding time of previous event
+    "cum_TW",         # cumulative wetting temperature since reset (seasonal)
 
-    # ── Step 4: marginal but retained (Δ = +0.002 cm/h) ───────────────────
-    "cum_FT",             # cumulative flooding time since reset
-
-    # ── Step 5: strong recovery after plateau (Δ = +0.016 cm/h) ───────────
-    "prev_RD",            # radiation during previous drying (photodegradation)
-
-    # ── Step 6: marginal but retained (Δ = +0.001 cm/h) ───────────────────
-    "prev_RW",            # radiation during previous wetting phase
+    # ── Marginal but retained ──────────────────────────────────────────────
+    "cum_FT",         # cumulative flooding time since reset
+    "prev_RD",        # radiation during previous drying (photodegradation)
+    "prev_RW",        # radiation during previous wetting phase
 ]
 
-# Final feature list used by the model (after log transforms).
-# This is what you pass to StandardScaler and XGBRegressor.
+# Final feature list passed to StandardScaler and LightGBM
+# (log1p versions substituted for raw HL columns)
 MODEL1_FEATURES = [
     LOG_TRANSFORM.get(f, f) for f in MODEL1_RAW_FEATURES
 ]
-
-# # ─────────────────────────────────────────────────────────────────────────────
-# # Model 2 features (23 total)
-# # ─────────────────────────────────────────────────────────────────────────────
-# # Used in: model2_reset.py, analysis/heatmap.py
-# #
-# # All features are aggregated from segment i-1 (the segment that just ended).
-# # Cross-segment history features are computed in build_dataset.py BEFORE the
-# # quality filter — this ensures IRD_direction always references the true
-# # previous reset, not the previous *good* reset.
-# #
-# # NOTE: prev_IRD_at_reset is kept as a feature even though the target is now
-# # the log-ratio — it serves as the denominator reference and carries
-# # important information about the basin's recent recovery level.
-#
-# # Aggregated from segment i-1
-# MODEL2_SEGMENT_FEATURES = [
-#     # Operational averages
-#     "mean_DrT",    # mean drying time across segment
-#     "mean_FT",     # mean flooding time across segment
-#     "mean_ALPHA",  # mean drying fraction (DrT / Ct) — consistent with Model 1
-#     "mean_HL",     # mean hydraulic load — ENDOGENOUS, fixed in heatmap
-#     # Totals
-#     "sum_DrT",     # total drying time (= mean_DrT x n_events)
-#     "sum_FT",      # total flooding time
-#     # Extremes
-#     "min_DrT",     # shortest drying period in segment
-#     "max_FT",      # longest flooding event in segment
-#     # Segment size
-#     "n_events",    # number of flooding events
-#     "total_LCT",   # total segment duration (h)
-#     # Weather
-#     "mean_RD",     # mean radiation during drying — key photodegradation driver
-#     "mean_TW",     # mean temperature (wet phase)
-#     "mean_TD",     # mean temperature (dry phase)
-#     # Last-event features: the drying period immediately before reset.
-#     # Physical rationale: the FINAL drying opportunity before tillage is
-#     # distinct from the segment average — a long sunny final drying period
-#     # maximises surface crust degradation just before the reset, directly
-#     # affecting how high IRD_at_reset will be. Confirmed by SHAP analysis.
-#     "last_DrT",    # DrT of the final event before reset
-#     "last_RD",     # radiation of the final drying period before reset
-# ]
-#
-# # Cross-segment history (computed in build_dataset.py before quality filter)
-# # prev_IRD_at_reset is the denominator for the log-ratio target and also
-# # serves as the primary autocorrelation feature.
-# MODEL2_HISTORY_FEATURES = [
-#     "prev_IRD_at_reset",       # IRD_at_reset of reset i-1 — denominator + autocorrelation
-#     "prev_prev_IRD_at_reset",  # IRD_at_reset of reset i-2 — two-step memory
-#     "IRD_direction",           # (IRD[i-1] - IRD[i-2]) / dt — recovery trend (cm/h/day)
-# ]
-#
-# # Seasonality at the reset date + daily ambient conditions
-# # month_sin ranks high in Model 2 feature importance — summer resets
-# # recover better than winter resets.
-# # DAT and DAR provide continuous ambient signal at the reset moment.
-# MODEL2_SEASON_FEATURES = [
-#     "month_sin",   # sin encoding — peak July (+1.0), trough January (-1.0)
-#     "month_cos",   # cos encoding — orthogonal component
-#     "DAT",         # daily avg temperature at reset moment — continuous seasonality
-#     "DAR",         # daily avg radiation at reset moment — continuous seasonality
-# ]
-#
-# # Final combined feature list for Model 2
-# MODEL2_FEATURES = (
-#     MODEL2_SEGMENT_FEATURES +
-#     MODEL2_HISTORY_FEATURES +
-#     MODEL2_SEASON_FEATURES
-# )
-
-
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Model 2 features — FINAL SET (11 features)
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# Feature selection methodology:
-# ---------------------------------------------------------------
-# Forward stepwise unconstrained selection on chrono split.
-# Metric: RMSE on raw IRD (cm/h) after back-transform on test split.
+# Selected by unconstrained forward stepwise selection on chrono split.
+# Metric: RMSE on raw IRD (cm/h) after back-transform on chrono test split.
 # See: outputs/tables/feature_selection_m2.xlsx
 #      analysis/feature_selection_m2.py
 #
-# Selection path (RMSE at each step):
-#   Naive baseline : 0.8202 cm/h
-#    1 feature (month_sin)               : 0.7730  Δ=+0.047 ✓ huge
-#    2 features (prev_IRD_at_reset)      : 0.7557  Δ=+0.017 ✓ strong
-#    3 features (mean_ALPHA)             : 0.7450  Δ=+0.011 ✓ strong
-#    4 features (total_LCT)              : 0.7259  Δ=+0.019 ✓ strongest
-#    5 features (DAR)                    : 0.7195  Δ=+0.006 ✓ good
-#    6 features (prev_prev_IRD_at_reset) : 0.7170  Δ=+0.002 ✓ marginal
-#    7 features (sum_DrT)               : 0.7096  Δ=+0.008 ✓ good
-#    8 features (last_RD)               : 0.7108  Δ=-0.001 ✗ worsened
-#    9 features (month_cos)             : 0.7104  Δ=+0.001 ✓ trivial
-#   10 features (sum_FT)               : 0.7076  Δ=+0.003 ✓ marginal
-#   11 features (last_DrT)             : 0.7017  Δ=+0.006 ✓ BEST ← STOP
+# Selection path:
+#   Naive baseline:  0.8202 cm/h
+#    1 feature:      0.7730  +month_sin               Δ=+0.047 ✓ huge
+#    2 features:     0.7557  +prev_IRD_at_reset        Δ=+0.017 ✓ strong
+#    3 features:     0.7450  +mean_ALPHA               Δ=+0.011 ✓ strong
+#    4 features:     0.7259  +total_LCT                Δ=+0.019 ✓ strongest
+#    5 features:     0.7195  +DAR                      Δ=+0.006 ✓ good
+#    6 features:     0.7170  +prev_prev_IRD_at_reset   Δ=+0.002 ✓ marginal
+#    7 features:     0.7096  +sum_DrT                  Δ=+0.008 ✓ good
+#    8 features:     0.7108  +last_RD                  Δ=-0.001 ✗ worsened
+#    9 features:     0.7104  +month_cos                Δ=+0.001 ✓ trivial
+#   10 features:     0.7076  +sum_FT                   Δ=+0.003 ✓ marginal
+#   11 features:     0.7017  +last_DrT                 Δ=+0.006 ✓ BEST → STOP
 #   12+ features: all worsen RMSE — clear elbow
 #
-# Features NOT selected (and why):
-#   mean_HL, mean_FT, mean_DrT  — segment averages outcompeted by
-#                                  totals (sum_DrT, sum_FT) and
-#                                  last-event values (last_DrT)
-#   mean_TW, mean_TD            — temperature averages not selected;
-#                                  DAR captures ambient conditions better
-#   DAT                         — daily ambient temperature at reset:
-#                                  worsened RMSE at step 16
-#   IRD_direction               — worsened RMSE at step 12
-#   n_events, max_FT, min_DrT   — consistently worsened after step 11
-#
-# Physical interpretation of final 11 features:
-#   month_sin              — primary seasonal signal (peak July);
-#                            recovery is seasonally driven
-#   prev_IRD_at_reset      — autocorrelation anchor: recovery is
-#                            strongly correlated with previous reset
-#   mean_ALPHA             — average drying fraction: more drying
-#                            relative to cycle time → better recovery
-#   total_LCT              — total flooding duration: proxy for
-#                            accumulated clogging severity before tillage
-#   DAR                    — daily ambient radiation at reset date:
-#                            photodegradation drives surface recovery
-#   prev_prev_IRD_at_reset — two-step history: recovery trajectory
-#                            not just most recent state
-#   sum_DrT                — cumulative drying time: total recovery
-#                            opportunity during the segment
-#   last_RD                — radiation in final drying event:
-#                            most proximal photodegradation signal
-#   month_cos              — orthogonal seasonal component
-#   sum_FT                 — total flooding load since reset:
-#                            cumulative clogging exposure
-#   last_DrT               — final drying duration before tillage:
-#                            recovery window immediately before reset
+# Full model RMSE vs 11-feature: 11-feature better by 0.054 cm/h.
 
 MODEL2_FEATURES = [
-    # ── Seasonality (selected first — dominant driver) ──────────────────────
-    "month_sin",               # primary seasonal signal
+    # ── Seasonality ────────────────────────────────────────────────────────
+    "month_sin",               # sin(2π(month-4)/12) — peak July = +1.0
     "month_cos",               # orthogonal seasonal component
 
-    # ── Cross-segment history (autocorrelation) ─────────────────────────────
-    "prev_IRD_at_reset",       # previous reset level
-    "prev_prev_IRD_at_reset",  # two-step history (1.1% NaN — expected)
+    # ── Cross-segment autocorrelation ──────────────────────────────────────
+    "prev_IRD_at_reset",       # previous reset level — primary autocorrelation
+    "prev_prev_IRD_at_reset",  # two-step history — medium-term trend
 
-    # ── Segment operational summary ─────────────────────────────────────────
-    "mean_ALPHA",              # average drying fraction
-    "total_LCT",               # total flooding duration
-    "sum_DrT",                 # cumulative drying time
-    "sum_FT",                  # cumulative flooding load
+    # ── Segment operational summary ────────────────────────────────────────
+    "mean_ALPHA",              # average drying fraction over segment
+    "total_LCT",               # total flooding duration of segment (h)
+    "sum_DrT",                 # cumulative drying time of segment (h)
+    "sum_FT",                  # cumulative flooding time of segment (h)
 
-    # ── Last-event features (most proximal signals) ─────────────────────────
+    # ── Last-event features (most proximal signals before tillage) ─────────
     "last_DrT",                # final drying duration before tillage
-    "last_RD",                 # final radiation during drying
+    "last_RD",                 # radiation in final drying event
 
-    # ── Ambient conditions at reset ─────────────────────────────────────────
-    "DAR",                     # daily ambient radiation at reset date
+    # ── Ambient conditions at reset ────────────────────────────────────────
+    "DAR",                     # daily ambient radiation at tillage date
+                               # OPERATIONALLY ACTIONABLE: till when sunny
 ]
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Model 2 feature sub-lists
+# ─────────────────────────────────────────────────────────────────────────────
+# These sub-lists are used by build_reset_dataset.py for aggregation logic.
+# They partition MODEL2_FEATURES by data source.
+
+# Features aggregated from segment i-1 events
+MODEL2_SEGMENT_FEATURES = [
+    "mean_ALPHA",   # mean drying fraction
+    "total_LCT",    # total flooding duration
+    "sum_DrT",      # cumulative drying time
+    "sum_FT",       # cumulative flooding time
+    "last_DrT",     # final drying duration before tillage
+    "last_RD",      # radiation in final drying event
+]
+
+# Cross-segment history features (from event_dataset.csv, pre-quality-filter)
+# prev_IRD_at_reset is both a feature AND the back-transform denominator
+MODEL2_HISTORY_FEATURES = [
+    "prev_IRD_at_reset",       # previous reset level — back-transform denominator
+    "prev_prev_IRD_at_reset",  # two-step history
+]
+
+# Seasonality and ambient conditions at reset date
+MODEL2_SEASON_FEATURES = [
+    "month_sin",   # sin encoding — peak July
+    "month_cos",   # cos encoding — orthogonal
+    "DAR",         # daily ambient radiation at reset date
+]
+
+# Validation: MODEL2_FEATURES must equal the union of all sub-lists
+_m2_check = set(MODEL2_SEGMENT_FEATURES + MODEL2_HISTORY_FEATURES + MODEL2_SEASON_FEATURES)
+assert _m2_check == set(MODEL2_FEATURES), (
+    f"MODEL2 sub-lists do not match MODEL2_FEATURES.\n"
+    f"  In sub-lists but not MODEL2_FEATURES: {_m2_check - set(MODEL2_FEATURES)}\n"
+    f"  In MODEL2_FEATURES but not sub-lists: {set(MODEL2_FEATURES) - _m2_check}"
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Columns needed from DuckDB to build the event dataset
+# Raw database columns needed to build event_dataset.csv
 # ─────────────────────────────────────────────────────────────────────────────
 RAW_DB_COLUMNS = [
     "opening_valve_date", "closing_valve_date",
@@ -390,7 +268,7 @@ RAW_DB_COLUMNS = [
     "TD", "TW", "RD", "RW", "HD", "PD", "DAT", "DAR",
 ]
 
-# Columns used to compute prev_* features (shifted within each segment)
+# Columns shifted within each segment to produce prev_* features
 PREV_SOURCE_COLS = [
     "DrT", "FT", "ALPHA", "HL",
     "TD", "RD", "HD", "PD",
@@ -398,7 +276,7 @@ PREV_SOURCE_COLS = [
     "AL", "ML", "AF",
 ]
 
-# Columns used to compute cum_* features (cumulative sum within each segment)
+# Columns cumulated within each segment to produce cum_* features
 CUM_SOURCE_COLS = {
     "cum_HL":  "HL",
     "cum_FT":  "FT",
@@ -409,8 +287,9 @@ CUM_SOURCE_COLS = {
     "cum_RW":  "RW",
 }
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Feature preparation function
+# Feature preparation — Model 1
 # ─────────────────────────────────────────────────────────────────────────────
 import numpy as np
 import pandas as pd
@@ -419,17 +298,28 @@ import pandas as pd
 def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     """
     Apply log1p transforms to skewed HL columns and return the final
-    feature column list for Model 1.
+    Model 1 feature column list.
 
     Parameters
     ----------
-    df : DataFrame containing at minimum the columns in MODEL1_RAW_FEATURES
+    df : DataFrame containing at minimum the columns in MODEL1_RAW_FEATURES.
+         basin_number is NOT required — this function does not filter by basin.
 
     Returns
     -------
     df       : copy of input with log1p columns added
-    features : list of column names to pass to the model
+    features : list of column names ready to pass to the model
                (log1p versions substituted for raw HL columns)
+
+    Notes
+    -----
+    - basin_number column is dropped by this function if present in the
+      returned feature list (it never is — it is not in MODEL1_RAW_FEATURES).
+    - If you need basin_number after calling prepare_features(), preserve it
+      before the call:
+          basin_col = df["basin_number"].copy()
+          df, feats = prepare_features(df)
+          df["basin_number"] = basin_col
 
     Example
     -------
@@ -444,7 +334,6 @@ def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
                 pd.to_numeric(df[raw_col], errors="coerce")
             )
 
-    # Build final feature list: substitute transformed names for raw names
     features: list[str] = []
     for col in MODEL1_RAW_FEATURES:
         transformed = LOG_TRANSFORM.get(col)
