@@ -1,19 +1,31 @@
 """
-analysis/basin_analysis.py — Per-basin evaluation and outlier flagging (V2)
-===========================================================================
-V2 changes over V1:
-  - Reads basin_role from event_dataset.csv (clean/outlier/held_out)
-  - Held-out basins annotated in plots and summary table
-  - OUTLIER_BASINS no longer hardcoded — CSV is the only source of truth
-  - Pass-1 model trained on ALL 50 basins (no pre-exclusions)
-  - Per-basin plots produced for all basins including held-out
+analysis/basin_analysis.py — Per-basin evaluation and outlier detection
+========================================================================
+Trains a pass-1 global LightGBM on ALL basins (including held-out),
+evaluates per-basin performance, classifies outlier types, and writes
+outlier_basins.csv.
 
-Execution order:
+This is the ONLY place outlier basins are defined. The CSV it produces
+is the single source of truth — no outlier basin numbers are hardcoded
+anywhere else in the project.
+
+Execution order
+---------------
   1. python -m pipeline.build_dataset --rebuild
   2. python -m pipeline.build_reset_dataset
-  3. python -m models.model1_decay   (pass 1 — all basins)
-     *** THIS SCRIPT RUNS HERE ***
-  4. python -m models.model1_decay   (pass 2 — reads outlier_basins.csv)
+  *** THIS SCRIPT RUNS HERE ***
+  * TBA python -m run_bootstrap - to find the best candidate to present in paper
+  3. python -m models.model1_decay
+  4. python -m models.model2_reset
+  5. python -m experiments.run_bootstrap
+
+Pass-1 design
+-------------
+  - Trains on ALL 50 basins including held-out
+  - Purpose: identify anomalous basins across the full system
+  - Held-out basins ARE in training for this diagnostic only
+  - Their outlier status affects Condition E training (which basins
+    are included), not the held-out test set
 
 Usage
 -----
@@ -32,10 +44,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import (
-    EVENT_CSV, OUTLIER_CSV,
-    BASIN_METRICS_XLSX, FIGURES_DIR,
+    EVENT_CSV, OUTLIER_CSV, TABLES_DIR, FIGURES_DIR,
     OUTLIER_R2_THRESHOLD, OUTLIER_REL_RMSE_THRESHOLD,
-    SPLIT_COLORS, SPLIT_MARKERS, SPLIT_ALPHA, SPLIT_SIZE,
     FIELD_NAMES,
 )
 from pipeline.features import prepare_features, TARGET_M1
@@ -45,25 +55,37 @@ from models.utils import (
     get_splits,
 )
 
-BASIN_PLOT_DIR = FIGURES_DIR / "basin_plots"
+# ── Output directories ────────────────────────────────────────────────────────
+BASIN_METRICS_XLSX = TABLES_DIR / "basin_metrics.xlsx"
+BASIN_PLOT_DIR     = FIGURES_DIR / "basin_plots"
 BASIN_PLOT_DIR.mkdir(parents=True, exist_ok=True)
 
+# ── Outlier type thresholds (data-derived in classify_outlier_types) ──────────
 LOW_RANGE_PERCENTILE = 20
 REGIME_SHIFT_FACTOR  = 1.5
 
+# ── Plot style — local constants (not imported from config) ───────────────────
+SPLIT_COLORS  = {"train": "#555555", "val": "#1C7293", "test": "#E07B39"}
+SPLIT_MARKERS = {"train": "o",       "val": "s",       "test": "^"}
+SPLIT_ALPHA   = {"train": 0.35,      "val": 0.85,      "test": 0.85}
+SPLIT_SIZE    = {"train": 15,        "val": 40,        "test": 40}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Load data — ALL 50 basins, good segments only (pass-1 model)
+# Load data — ALL basins, good segments only
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_events() -> tuple[pd.DataFrame, list[str]]:
     """
-    Load good events from ALL 50 basins.
-    No basin exclusions — this is the pass-1 full model.
+    Load good events from ALL 50 basins — no exclusions.
+    Pass-1 model uses the full dataset to identify anomalous basins.
     basin_role column preserved for annotation in plots.
     """
     if not EVENT_CSV.exists():
-        raise FileNotFoundError(f"{EVENT_CSV} not found.")
+        raise FileNotFoundError(
+            f"{EVENT_CSV} not found.\n"
+            "Run: python -m pipeline.build_dataset --rebuild"
+        )
 
     df = pd.read_csv(EVENT_CSV, parse_dates=["opening_valve_date"])
     df = df.loc[:, ~df.columns.duplicated()]
@@ -72,26 +94,23 @@ def load_events() -> tuple[pd.DataFrame, list[str]]:
         if "IRD_norm" in df.columns:
             df[TARGET_M1] = df["IRD_norm"]
         else:
-            raise ValueError(f"Target '{TARGET_M1}' not found.")
+            raise ValueError(f"Target '{TARGET_M1}' not found in CSV.")
 
-    # Good events only — all basins including held-out
+    # Good events only — all 50 basins
     df = df[
-        (df["row_type"]       == "event") &
+        (df["row_type"]        == "event") &
         (df["is_good_segment"] == True)
     ].copy()
 
-    # Ensure basin_role exists — default to 'clean' if column missing
-    # (backwards compatibility with V1 CSVs)
     if "basin_role" not in df.columns:
-        print("  WARNING: basin_role column not found — "
-              "rebuild from V2 build_dataset.py for full functionality")
+        print("  WARNING: basin_role not found — defaulting to 'clean'.")
+        print("  Rebuild CSV with: python -m pipeline.build_dataset --rebuild")
         df["basin_role"] = "clean"
 
     df, feat_cols = prepare_features(df)
 
-    # Summary by role
     role_counts = df.groupby("basin_role")["basin_number"].nunique()
-    print(f"  Loaded {len(df)} good events  "
+    print(f"  Loaded {len(df):,} good events  "
           f"{df['basin_number'].nunique()} basins")
     for role, n in role_counts.items():
         print(f"    {role:<12}: {n} basins")
@@ -100,7 +119,7 @@ def load_events() -> tuple[pd.DataFrame, list[str]]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Per-basin metrics — identical to V1
+# Per-basin metrics
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_per_basin_metrics(
@@ -111,7 +130,7 @@ def compute_per_basin_metrics(
     used_cols: list[str],
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Evaluate the global model on each basin's val+test events.
+    Evaluate the pass-1 global model on each basin's val+test events.
     Back-transforms predictions to raw IRD (cm/h).
     Returns (metrics_df, eval_df).
     """
@@ -130,7 +149,7 @@ def compute_per_basin_metrics(
 
     rows = []
     for bn, bdf in eval_df.groupby("basin_number"):
-        n_train   = int((df[df["basin_number"] == bn]["split"] == "train").sum())
+        n_train    = int((df[df["basin_number"] == bn]["split"] == "train").sum())
         basin_role = str(
             df.loc[df["basin_number"] == bn, "basin_role"].iloc[0]
             if len(df[df["basin_number"] == bn]) > 0 else "clean"
@@ -158,14 +177,20 @@ def compute_per_basin_metrics(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Outlier type classification — identical to V1
+# Outlier type classification
 # ─────────────────────────────────────────────────────────────────────────────
 
 def classify_outlier_types(
     metrics_df:  pd.DataFrame,
     good_events: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Classify each flagged basin into Type1, Type2, or Type3."""
+    """
+    Classify each auto-flagged basin into Type 1, Type 2, or Type 3.
+
+    Type 1 — Low dynamic range: IRD IQR below 20th system percentile
+    Type 2 — Regime shift:      large IRD step change mid-record
+    Type 3 — Non-stationary:    neither Type 1 nor Type 2
+    """
     metrics_df = metrics_df.copy()
     metrics_df["outlier_type"]        = ""
     metrics_df["outlier_type_label"]  = ""
@@ -176,39 +201,36 @@ def classify_outlier_types(
         ird = pd.to_numeric(bdf["IRD"], errors="coerce").dropna()
         if len(ird) < 10:
             continue
-        iqr = float(np.percentile(ird, 75) - np.percentile(ird, 25))
-        mid = len(ird) // 2
-        ird_sorted  = bdf.sort_values("opening_valve_date")["IRD"]
-        ird_sorted  = pd.to_numeric(ird_sorted, errors="coerce").dropna()
-        mean_first  = float(ird_sorted.iloc[:mid].mean())
-        mean_second = float(ird_sorted.iloc[mid:].mean())
-        half_diff   = abs(mean_first - mean_second)
-        reset_ird   = pd.to_numeric(
-            bdf.groupby("segment_id")["IRD_at_reset"].first(),
-            errors="coerce"
+        iqr     = float(np.percentile(ird, 75) - np.percentile(ird, 25))
+        mid     = len(ird) // 2
+        ird_srt = pd.to_numeric(
+            bdf.sort_values("opening_valve_date")["IRD"], errors="coerce"
         ).dropna()
-        reset_std = float(reset_ird.std()) if len(reset_ird) > 1 else np.nan
+        mean_first  = float(ird_srt.iloc[:mid].mean())
+        mean_second = float(ird_srt.iloc[mid:].mean())
+        reset_ird   = pd.to_numeric(
+            bdf.groupby("segment_id")["IRD_at_reset"].first(), errors="coerce"
+        ).dropna()
         basin_chars[int(bn)] = dict(
-            iqr=iqr, half_diff=half_diff,
-            mean_first=mean_first, mean_second=mean_second,
-            reset_std=reset_std,
+            iqr        = iqr,
+            half_diff  = abs(mean_first - mean_second),
+            mean_first = mean_first,
+            mean_second= mean_second,
+            reset_std  = float(reset_ird.std()) if len(reset_ird) > 1 else np.nan,
         )
 
-    all_iqrs       = [v["iqr"]       for v in basin_chars.values() if np.isfinite(v["iqr"])]
-    all_half_diffs = [v["half_diff"] for v in basin_chars.values() if np.isfinite(v["half_diff"])]
-    all_reset_stds = [v["reset_std"] for v in basin_chars.values() if np.isfinite(v["reset_std"])]
+    all_iqrs   = [v["iqr"]       for v in basin_chars.values() if np.isfinite(v["iqr"])]
+    all_diffs  = [v["half_diff"] for v in basin_chars.values() if np.isfinite(v["half_diff"])]
+    all_rst    = [v["reset_std"] for v in basin_chars.values() if np.isfinite(v["reset_std"])]
 
-    type1_iqr_threshold      = float(np.percentile(all_iqrs, LOW_RANGE_PERCENTILE))
-    type2_diff_threshold     = float(np.median(all_half_diffs) * REGIME_SHIFT_FACTOR)
-    type3_reset_std_threshold= float(np.median(all_reset_stds))
+    t1 = float(np.percentile(all_iqrs,  LOW_RANGE_PERCENTILE))
+    t2 = float(np.median(all_diffs) * REGIME_SHIFT_FACTOR)
+    t3 = float(np.median(all_rst))
 
     print(f"\n  Outlier type thresholds (data-derived):")
-    print(f"    Type 1 — IQR < {type1_iqr_threshold:.3f} cm/h "
-          f"(bottom {LOW_RANGE_PERCENTILE}th percentile)")
-    print(f"    Type 2 — half-diff > {type2_diff_threshold:.3f} cm/h "
-          f"(median × {REGIME_SHIFT_FACTOR})")
-    print(f"    Type 3 — residual  "
-          f"(reset_std median = {type3_reset_std_threshold:.3f} cm/h)")
+    print(f"    Type 1 — IQR < {t1:.3f} cm/h  (bottom {LOW_RANGE_PERCENTILE}th pct)")
+    print(f"    Type 2 — half-diff > {t2:.3f} cm/h  (median × {REGIME_SHIFT_FACTOR})")
+    print(f"    Type 3 — residual  (reset_std median = {t3:.3f} cm/h)")
 
     for idx, row in metrics_df.iterrows():
         if not row["auto_flag"]:
@@ -217,144 +239,113 @@ def classify_outlier_types(
         if bn not in basin_chars:
             metrics_df.at[idx, "outlier_type"]        = "Type3"
             metrics_df.at[idx, "outlier_type_label"]  = "Non-stationary operations"
-            metrics_df.at[idx, "outlier_type_reason"] = "Insufficient data for type detection"
+            metrics_df.at[idx, "outlier_type_reason"] = "Insufficient data"
             continue
 
-        chars = basin_chars[bn]
+        c = basin_chars[bn]
 
-        if chars["iqr"] <= type1_iqr_threshold:
+        if c["iqr"] <= t1:
             metrics_df.at[idx, "outlier_type"]        = "Type1"
             metrics_df.at[idx, "outlier_type_label"]  = "Low dynamic range"
             metrics_df.at[idx, "outlier_type_reason"] = (
-                f"IQR={chars['iqr']:.3f} <= {type1_iqr_threshold:.3f} cm/h"
-            )
-            continue
-
-        if chars["half_diff"] >= type2_diff_threshold:
-            direction = "decreasing" if chars["mean_second"] < chars["mean_first"] else "increasing"
+                f"IQR={c['iqr']:.3f} <= {t1:.3f} cm/h")
+        elif c["half_diff"] >= t2:
+            direction = "decreasing" if c["mean_second"] < c["mean_first"] else "increasing"
             metrics_df.at[idx, "outlier_type"]        = "Type2"
             metrics_df.at[idx, "outlier_type_label"]  = "Regime shift"
             metrics_df.at[idx, "outlier_type_reason"] = (
-                f"half_diff={chars['half_diff']:.3f} >= {type2_diff_threshold:.3f} cm/h  "
-                f"IRD {direction}"
-            )
-            continue
-
-        reset_std_note = ""
-        if np.isfinite(chars["reset_std"]):
-            above = chars["reset_std"] > type3_reset_std_threshold
-            reset_std_note = (
-                f"  reset_std={chars['reset_std']:.3f} "
-                f"({'above' if above else 'below'} median "
-                f"{type3_reset_std_threshold:.3f})"
-            )
-        metrics_df.at[idx, "outlier_type"]        = "Type3"
-        metrics_df.at[idx, "outlier_type_label"]  = "Non-stationary operations"
-        metrics_df.at[idx, "outlier_type_reason"] = (
-            f"Not Type1 (IQR={chars['iqr']:.3f}) "
-            f"or Type2 (half_diff={chars['half_diff']:.3f}).{reset_std_note}"
-        )
+                f"half_diff={c['half_diff']:.3f} >= {t2:.3f} cm/h  IRD {direction}")
+        else:
+            metrics_df.at[idx, "outlier_type"]        = "Type3"
+            metrics_df.at[idx, "outlier_type_label"]  = "Non-stationary operations"
+            metrics_df.at[idx, "outlier_type_reason"] = (
+                f"Not Type1 (IQR={c['iqr']:.3f}) or Type2 "
+                f"(half_diff={c['half_diff']:.3f})")
 
     return metrics_df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Print summary — V2 adds basin_role column
+# Print summary table
 # ─────────────────────────────────────────────────────────────────────────────
 
 def print_metrics_table(metrics_df: pd.DataFrame) -> None:
-    """Print per-basin metrics sorted by R² (worst first)."""
     print(f"\n  {'Basin':>7}  {'Field':<10}  {'Role':<10}  {'n_eval':>6}  "
-          f"{'R²':>7}  {'RMSE':>7}  {'rel_RMSE':>9}  "
-          f"{'MAPE%':>7}  {'Flag':>5}  {'Type':<8}")
+          f"{'R²':>7}  {'RMSE':>7}  {'rel_RMSE':>9}  {'MAPE%':>7}  "
+          f"{'Flag':>5}  {'Type':<8}")
     print(f"  {'-'*90}")
 
     for _, row in metrics_df.iterrows():
         flag  = "FLAG" if row["auto_flag"] else ""
         otype = row.get("outlier_type", "")
         role  = row.get("basin_role", "")
-        print(
-            f"  {int(row['basin_number']):>7}  "
-            f"{str(row['field_name']):<10}  "
-            f"{role:<10}  "
-            f"{int(row['n']):>6}  "
-            f"{row['r2']:>+7.3f}  "
-            f"{row['rmse']:>7.3f}  "
-            f"{row['rel_rmse']:>9.3f}  "
-            f"{row['mape']:>7.1f}  "
-            f"{flag:>5}  "
-            f"{otype:<8}"
-        )
+        print(f"  {int(row['basin_number']):>7}  "
+              f"{str(row['field_name']):<10}  {role:<10}  "
+              f"{int(row['n']):>6}  {row['r2']:>+7.3f}  "
+              f"{row['rmse']:>7.3f}  {row['rel_rmse']:>9.3f}  "
+              f"{row['mape']:>7.1f}  {flag:>5}  {otype:<8}")
 
     flagged = metrics_df[metrics_df["auto_flag"]]
     print(f"\n  Auto-flagged: {len(flagged)} basins")
 
     if "outlier_type" in metrics_df.columns:
         print(f"\n  Type breakdown:")
-        for t, label in [
-            ("Type1", "Low dynamic range"),
-            ("Type2", "Regime shift"),
-            ("Type3", "Non-stationary operations"),
-        ]:
-            n = int((metrics_df["outlier_type"] == t).sum())
+        for t, label in [("Type1", "Low dynamic range"),
+                         ("Type2", "Regime shift"),
+                         ("Type3", "Non-stationary operations")]:
+            n      = int((metrics_df["outlier_type"] == t).sum())
             basins = metrics_df.loc[
                 metrics_df["outlier_type"] == t, "basin_number"
             ].astype(int).tolist()
             if n > 0:
                 print(f"    {t} — {label:<30}: {n} basin(s)  {basins}")
 
-    # Held-out basin performance summary
+    # Held-out basin performance note
     held_out = metrics_df[metrics_df.get("basin_role", pd.Series()) == "held_out"]
     if len(held_out) > 0:
-        print(f"\n  Held-out basin performance (pass-1 model — these basins were in training):")
-        print(f"  {'Basin':>7}  {'Field':<10}  {'R²':>7}  {'MAPE%':>7}  {'Flag':>5}")
+        print(f"\n  Held-out basins (in pass-1 training — for reference only):")
         for _, row in held_out.iterrows():
-            flag = "FLAG" if row["auto_flag"] else ""
-            print(f"  {int(row['basin_number']):>7}  "
+            flag = "FLAG" if row["auto_flag"] else "ok"
+            print(f"    Basin {int(row['basin_number']):>6}  "
                   f"{str(row['field_name']):<10}  "
-                  f"{row['r2']:>+7.3f}  "
-                  f"{row['mape']:>7.1f}  "
-                  f"{flag:>5}")
-        print(f"  NOTE: In pass-2 condition D, these basins are EXCLUDED from training.")
-        print(f"  Their held-out test performance will be reported separately.")
+                  f"R²={row['r2']:>+7.3f}  {flag}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Write outlier_basins.csv — identical to V1, no hardcoded list
+# Write outlier_basins.csv
 # ─────────────────────────────────────────────────────────────────────────────
 
 def write_outlier_csv(metrics_df: pd.DataFrame) -> None:
-    """Write auto-flagged basins to outlier_basins.csv."""
-    flagged = metrics_df[metrics_df["auto_flag"]].copy()
-    flagged = flagged.sort_values("r2")
+    """
+    Write auto-flagged basins to outlier_basins.csv.
+    This CSV is the single source of truth for outlier basin numbers.
+    No outlier basin numbers are hardcoded anywhere else.
+    """
+    flagged = metrics_df[metrics_df["auto_flag"]].sort_values("r2").copy()
 
     lines = [
-        "# Auto-generated by analysis/basin_analysis.py (V2)",
-        f"# Flagging criteria: R² < {OUTLIER_R2_THRESHOLD} "
-        f"OR rel_RMSE > {OUTLIER_REL_RMSE_THRESHOLD}",
+        "# Auto-generated by analysis/basin_analysis.py",
+        f"# Criteria: R² < {OUTLIER_R2_THRESHOLD} OR "
+        f"rel_RMSE > {OUTLIER_REL_RMSE_THRESHOLD}",
         "#",
-        "# outlier_type: Type1=Low dynamic range  "
-        "Type2=Regime shift  Type3=Non-stationary",
+        "# Type1 = Low dynamic range",
+        "# Type2 = Regime shift",
+        "# Type3 = Non-stationary operations",
         "#",
-        "# NOTE: held_out basins are listed here for reference only.",
-        "# They are NOT excluded from pass-1 training.",
-        "# Their exclusion from pass-2 condition D training is controlled",
-        "# by config.HELD_OUT_BASIN_LIST, not this file.",
-        "#",
-        "# To add visually identified outliers, append lines below.",
+        "# To add manually identified outliers, append rows below.",
         "# Format: basin_number,outlier_type,outlier_type_label,r2,rel_rmse,reason",
         "basin_number,outlier_type,outlier_type_label,r2,rel_rmse,reason",
     ]
 
     for _, row in flagged.iterrows():
-        bn      = int(row["basin_number"])
-        otype   = row.get("outlier_type",       "Type3")
-        olabel  = row.get("outlier_type_label", "Non-stationary operations")
-        oreason = row.get("outlier_type_reason","")
+        bn     = int(row["basin_number"])
+        otype  = row.get("outlier_type",       "Type3")
+        olabel = row.get("outlier_type_label", "Non-stationary operations")
+        oreason= row.get("outlier_type_reason","")
         lines.append(
             f"{bn},{otype},{olabel},"
             f"{row['r2']:.3f},{row['rel_rmse']:.3f},"
-            f"R²={row['r2']:.3f} rel_RMSE={row['rel_rmse']:.3f} | {oreason}"
+            f"R²={row['r2']:.3f} | {oreason}"
         )
 
     OUTLIER_CSV.parent.mkdir(parents=True, exist_ok=True)
@@ -362,25 +353,22 @@ def write_outlier_csv(metrics_df: pd.DataFrame) -> None:
         f.write("\n".join(lines) + "\n")
 
     print(f"\n  Written: {OUTLIER_CSV}")
-    print(f"  {len(flagged)} basins auto-flagged:")
+    print(f"  {len(flagged)} basins flagged:")
     for _, row in flagged.iterrows():
-        role_note = (
-            f"  [held_out]" if row.get("basin_role") == "held_out" else ""
-        )
-        print(
-            f"    Basin {int(row['basin_number']):>6}  "
-            f"R²={row['r2']:+.3f}  rel_RMSE={row['rel_rmse']:.3f}  "
-            f"→ {row.get('outlier_type','?')} "
-            f"({row.get('outlier_type_label','')})"
-            f"{role_note}"
-        )
-    print("\n  → Review: outputs/figures/basin_plots/")
-    print("  → Edit if needed: data/outlier_basins.csv")
-    print("  → Then run: python -m models.model1_decay  (pass 2)")
+        role_note = "  [held_out]" if row.get("basin_role") == "held_out" else ""
+        print(f"    Basin {int(row['basin_number']):>6}  "
+              f"R²={row['r2']:+.3f}  rel_RMSE={row['rel_rmse']:.3f}  "
+              f"→ {row.get('outlier_type','?')} "
+              f"({row.get('outlier_type_label','')})"
+              f"{role_note}")
+
+    print("\n  → Review plots:    outputs/figures/basin_plots/")
+    print(  "  → Edit if needed: data/outlier_basins.csv")
+    print(  "  → Then run:       python -m models.model1_decay")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Per-basin diagnostic plot — V2 adds held_out annotation
+# Per-basin diagnostic plot
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_basin(
@@ -390,10 +378,9 @@ def plot_basin(
     flagged: bool,
 ) -> None:
     """
-    Two-panel diagnostic plot for one basin.
+    Two-panel diagnostic plot per basin.
     Top:    IRD time series — actual vs predicted, coloured by split
-    Bottom: scatter actual vs predicted (val + test only)
-    Held-out basins annotated in title.
+    Bottom: scatter actual vs predicted (val + test)
     Saved to outputs/figures/basin_plots/basin_{bn}.png
     """
     field      = FIELD_NAMES.get(int(str(bn)[0]), str(bn))
@@ -401,11 +388,12 @@ def plot_basin(
     olabel     = metrics.get("outlier_type_label", "")
     basin_role = metrics.get("basin_role", "clean")
 
-    flag_str = ""
     if basin_role == "held_out":
-        flag_str = "  [HELD-OUT — in pass-1 training, excluded from pass-2 condition D]"
+        flag_str = "  [HELD-OUT]"
     elif flagged and otype:
         flag_str = f"  ⚠ {otype} — {olabel}"
+    else:
+        flag_str = ""
 
     fig = plt.figure(figsize=(12, 8))
     fig.suptitle(
@@ -414,13 +402,12 @@ def plot_basin(
         f"RMSE={metrics.get('rmse', np.nan):.3f} cm/h  "
         f"rel_RMSE={metrics.get('rel_rmse', np.nan):.3f}  "
         f"MAPE={metrics.get('mape', np.nan):.1f}%  "
-        f"n_eval={metrics.get('n', 0)}  "
-        f"role={basin_role}",
+        f"n_eval={metrics.get('n', 0)}  role={basin_role}",
         fontsize=10,
     )
     gs = gridspec.GridSpec(2, 1, figure=fig, hspace=0.45)
 
-    # ── Time series ───────────────────────────────────────────────────────────
+    # Time series
     ax_ts = fig.add_subplot(gs[0])
     for split in ["train", "val", "test"]:
         sub = bdf[bdf["split"] == split].sort_values("opening_valve_date")
@@ -457,7 +444,7 @@ def plot_basin(
     ax_ts.tick_params(axis="x", rotation=30, labelsize=7)
     ax_ts.legend(fontsize=7, ncol=3); ax_ts.grid(True, alpha=0.2)
 
-    # ── Scatter ───────────────────────────────────────────────────────────────
+    # Scatter
     ax_sc = fig.add_subplot(gs[1])
     eval_df = bdf[
         bdf["split"].isin(["val", "test"]) &
@@ -475,8 +462,7 @@ def plot_basin(
                     marker=SPLIT_MARKERS[split], label=split, zorder=3,
                 )
         all_v = np.concatenate(
-            [eval_df["ird_actual"].values, eval_df["ird_pred"].values]
-        )
+            [eval_df["ird_actual"].values, eval_df["ird_pred"].values])
         all_v = all_v[np.isfinite(all_v) & (all_v > 0)]
         if len(all_v):
             lo = np.percentile(all_v, 1) * 0.9
@@ -493,6 +479,7 @@ def plot_basin(
             fontsize=8, va="top",
             bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.85),
         )
+
     ax_sc.set_xlabel("IRD actual (cm/h)"); ax_sc.set_ylabel("IRD predicted (cm/h)")
     ax_sc.set_title("Scatter — val + test")
     ax_sc.legend(fontsize=8); ax_sc.grid(True, alpha=0.2)
@@ -504,31 +491,27 @@ def plot_basin(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Summary histogram — identical to V1
+# Summary histogram
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_metric_histograms(metrics_df: pd.DataFrame) -> None:
-    """Three-panel histogram of per-basin R², rel_RMSE, and MAPE."""
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     fig.suptitle(
         f"Per-basin metric distributions — {len(metrics_df)} basins\n"
-        "Pass-1 global LightGBM model (all 50 basins)",
+        "Pass-1 global LightGBM (all 50 basins)",
         fontsize=11,
     )
 
-    plot_specs = [
-        (axes[0], "r2",       "steelblue",    "R²",
-         OUTLIER_R2_THRESHOLD,       True),
-        (axes[1], "rel_rmse", "seagreen",     "rel_RMSE",
-         OUTLIER_REL_RMSE_THRESHOLD, False),
-        (axes[2], "mape",     "mediumpurple", "MAPE (%)",
-         None,                        False),
+    specs = [
+        (axes[0], "r2",       "steelblue",    "R²",        OUTLIER_R2_THRESHOLD),
+        (axes[1], "rel_rmse", "seagreen",     "rel_RMSE",  OUTLIER_REL_RMSE_THRESHOLD),
+        (axes[2], "mape",     "mediumpurple", "MAPE (%)",  None),
     ]
 
-    for ax, col, color, xlabel, threshold, _ in plot_specs:
+    for ax, col, color, xlabel, threshold in specs:
         vals         = metrics_df[col].dropna().values
         flagged_vals = metrics_df.loc[metrics_df["auto_flag"], col].dropna().values
-        ax.hist(vals,         bins=20, color=color,   edgecolor="white",
+        ax.hist(vals, bins=20, color=color, edgecolor="white",
                 alpha=0.75, label="all basins")
         if len(flagged_vals):
             ax.hist(flagged_vals, bins=20, color="tomato", edgecolor="white",
@@ -550,107 +533,21 @@ def plot_metric_histograms(metrics_df: pd.DataFrame) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Final summary table — identical to V1
-# ─────────────────────────────────────────────────────────────────────────────
-
-def print_final_summary(
-    good_events: pd.DataFrame,
-    metrics_df:  pd.DataFrame,
-) -> None:
-    """Print dataset summary before and after removing outlier basins."""
-    outlier_basins = set(
-        metrics_df.loc[metrics_df["auto_flag"], "basin_number"].astype(int).tolist()
-    )
-
-    full_csv = pd.read_csv(EVENT_CSV, parse_dates=["opening_valve_date"])
-    full_csv = full_csv.loc[:, ~full_csv.columns.duplicated()]
-    full_csv["filter_reason"]   = full_csv["filter_reason"].fillna("")
-    full_csv["is_good_segment"] = full_csv["is_good_segment"].fillna(False).astype(bool)
-    full_csv = full_csv[full_csv["filter_reason"] != "after_cutoff"].copy()
-
-    clean_csv = full_csv[~full_csv["basin_number"].isin(outlier_basins)].copy()
-
-    FUNNEL_STEPS = [
-        ("raw",                "Raw events (study period)",           None),
-        ("outlier_basins",     "Removed — outlier basins",            "__outlier_basins__"),
-        ("quality_filter_IRD_R_squared", "Drainage R² < 0.94",       "quality_filter_IRD_R_squared"),
-        ("quality_filter_CIV", "Quality filter — CIV < 3000 m³",     "quality_filter_CIV"),
-        ("quality_filter_Ct",  "Quality filter — Ct < 20h",          "quality_filter_Ct"),
-        ("quality_filter_AL",  "Quality filter — AL < 5cm",          "quality_filter_AL"),
-        ("pre_segment",        "Pre-segment (before 1st reset)",      "pre_segment"),
-        ("too_few_events",     "Too few events (<4)",                 "too_few_events"),
-        ("pearson_r_positive", "No decay signal (Pearson r > -0.05)", "pearson_r_positive"),
-        ("fit_failed",         "Fit failed",                          "fit_failed"),
-        ("r2_below_threshold", "R² below threshold",                  "r2_below_threshold"),
-        ("good",               "Good events (used for training)",      ""),
-    ]
-
-    n_outlier_events = len(full_csv) - len(clean_csv)
-
-    def _count(df, reason):
-        if reason is None:    return len(df)
-        if reason == "":      return int((df["filter_reason"] == "").sum())
-        return int((df["filter_reason"] == reason).sum())
-
-    print("\n" + "=" * 75)
-    print("  FINAL DATASET SUMMARY")
-    print("=" * 75)
-    print(f"  {'Step':<44}  {'All 50 basins':>13}  {'Clean dataset':>13}")
-    print(f"  {'-'*72}")
-
-    for key, label, reason in FUNNEL_STEPS:
-        if reason == "__outlier_basins__":
-            val_all   = "-"
-            val_clean = str(n_outlier_events)
-        elif reason is None:
-            val_all   = str(len(full_csv))
-            val_clean = str(len(clean_csv))
-        else:
-            val_all   = str(_count(full_csv,  reason))
-            val_clean = str(_count(clean_csv, reason))
-
-        marker = "  ← used for training" if key == "good" else ""
-        print(f"  {label:<44}  {val_all:>13}  {val_clean:>13}{marker}")
-
-    n_good_all   = _count(full_csv,  "")
-    n_good_clean = _count(clean_csv, "")
-    pct_all   = round(100 * n_good_all   / len(full_csv),  1)
-    pct_clean = round(100 * n_good_clean / len(clean_csv), 1)
-    print(f"  {'% events used':<44}  {str(pct_all)+'%':>13}  {str(pct_clean)+'%':>13}")
-    print("=" * 75)
-
-    print(f"\n  Removed basins ({len(outlier_basins)} total):")
-    print(f"  {'Basin':>7}  {'Field':<10}  {'Role':<10}  "
-          f"{'Type':<8}  {'Label':<30}  {'R²':>7}")
-    print(f"  {'-'*72}")
-    flagged_rows = metrics_df[metrics_df["auto_flag"]].sort_values("outlier_type")
-    for _, row in flagged_rows.iterrows():
-        print(
-            f"  {int(row['basin_number']):>7}  "
-            f"{str(row['field_name']):<10}  "
-            f"{row.get('basin_role',''):<10}  "
-            f"{row.get('outlier_type','?'):<8}  "
-            f"{row.get('outlier_type_label',''):<30}  "
-            f"{row['r2']:>+7.3f}"
-        )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> pd.DataFrame:
     print("=" * 65)
-    print("  BASIN ANALYSIS V2 — analysis/basin_analysis.py")
-    print("  Pass-1: global model on ALL 50 basins")
+    print("  BASIN ANALYSIS — analysis/basin_analysis.py")
+    print("  Pass-1: global LightGBM on ALL 50 basins")
+    print("  Output: outlier_basins.csv — single source of truth")
     print("=" * 65)
 
-    # Load all basins — no exclusions
     df, feat_cols = load_events()
 
     train, val, test = get_splits(df, feat_cols, TARGET_M1, split_col="split")
 
-    print("\n--- Training pass-1 global LightGBM (all 50 basins) ---")
+    print("\n--- Training pass-1 global LightGBM ---")
     model, scaler, used_cols = train_lightgbm(
         train, val, feat_cols, TARGET_M1, model2=False
     )
@@ -678,15 +575,14 @@ def main() -> pd.DataFrame:
 
     write_outlier_csv(metrics_df)
 
-    # Per-basin plots — all 50 basins
-    print(f"\n--- Generating per-basin plots (all 50 basins) ---")
+    # Per-basin diagnostic plots
+    print(f"\n--- Generating per-basin plots ({df['basin_number'].nunique()} basins) ---")
     metrics_lookup = {
         int(row["basin_number"]): row.to_dict()
         for _, row in metrics_df.iterrows()
     }
 
-    all_basins = sorted(df["basin_number"].unique())
-    for bn in all_basins:
+    for bn in sorted(df["basin_number"].unique()):
         bdf = eval_df[eval_df["basin_number"] == bn].copy()
         train_rows = df[
             (df["basin_number"] == bn) & (df["split"] == "train")
@@ -697,15 +593,11 @@ def main() -> pd.DataFrame:
         )
         train_rows["ird_pred"] = np.nan
         bdf = pd.concat([bdf, train_rows], ignore_index=True)
-        m = metrics_lookup.get(int(bn), {})
+        m   = metrics_lookup.get(int(bn), {})
         plot_basin(int(bn), bdf, m, flagged=m.get("auto_flag", False))
 
-    print(f"  Saved {len(all_basins)} basin plots → {BASIN_PLOT_DIR}")
-
+    print(f"  Saved {df['basin_number'].nunique()} plots → {BASIN_PLOT_DIR}")
     plot_metric_histograms(metrics_df)
-
-    print("\n--- Final dataset summary ---")
-    print_final_summary(df, metrics_df)
 
     print("\n" + "=" * 65)
     print("  NEXT STEPS")
@@ -713,7 +605,9 @@ def main() -> pd.DataFrame:
     print(f"  1. Review: {BASIN_METRICS_XLSX.name}")
     print(f"  2. Review plots: {BASIN_PLOT_DIR}")
     print(f"  3. Edit if needed: {OUTLIER_CSV}")
-    print(f"  4. Run pass-2: python -m models.model1_decay")
+    print(f"  4. Run python -m experiment.run_bootstrap")
+    print(f"  5. Run models: python -m models.model1_decay")
+    print(f"                 python -m models.model2_reset")
     print("\nDone.")
 
     return metrics_df
