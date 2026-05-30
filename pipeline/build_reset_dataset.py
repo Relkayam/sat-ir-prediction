@@ -6,8 +6,11 @@ Builds one row per reset event from event_dataset.csv.
 All basins have basin_role == 'clean'.
 Held-out basin selection happens at bootstrap runtime — not here.
 
-Only split_chrono is baked into the CSV (chronological 70/15/15 per basin).
-All other splits computed at runtime by the bootstrap and model scripts.
+split_chrono is the only split baked into the CSV. It is a per-basin
+chronological TRAIN/VAL split (TRAIN_FRAC / 1−TRAIN_FRAC) used ONLY for
+LightGBM early stopping. There is NO chronological test slice: the test set
+is the 5 held-out basins selected by the bootstrap, so every reset row here
+is either 'train' or 'val'.
 
 Usage
 -----
@@ -24,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import (
     EVENT_CSV, RESET_CSV, TABLES_DIR,
-    TRAIN_FRAC, VAL_FRAC,
+    TRAIN_FRAC,
     SEASON_PHASE, FIELD_NAMES,
 )
 from pipeline.features import MODEL2_FEATURES, TARGET_M2
@@ -45,6 +48,11 @@ def _to_float(val) -> float:
 
 
 def _month_encoding(month: int) -> tuple[float, float]:
+    # NOTE: month_sin/month_cos are NOT in the final MODEL2_FEATURES (Set-D
+    # dropped month encoding in favour of radiation features). They are kept
+    # here only as candidate columns for the feature-selection / alternative-
+    # set comparison (Figure S2 / Table S3). If that comparison no longer
+    # references month encoding, this function and the two columns can go.
     sin_val = float(np.sin(2 * np.pi * (month - SEASON_PHASE) / 12))
     cos_val = float(np.cos(2 * np.pi * (month - SEASON_PHASE) / 12))
     return sin_val, cos_val
@@ -126,7 +134,6 @@ def _build_row(bn: int, reset_row: pd.Series, prev_events: pd.DataFrame) -> dict
         "field_name":      FIELD_NAMES.get(int(str(bn)[0]), str(bn)),
         "segment_id":      int(reset_row["segment_id"]),
         "reset_date":      reset_row["opening_valve_date"],
-        "is_good_segment": bool(reset_row.get("is_good_segment", False)),
         "basin_role":      "clean",
 
         # Target
@@ -136,7 +143,7 @@ def _build_row(bn: int, reset_row: pd.Series, prev_events: pd.DataFrame) -> dict
         "IRD_at_reset":          float(ird_current),
         "prev_IRD_at_reset_raw": float(ird_prev),
 
-        # Current model features
+        # Candidate seasonal encoding (not in final feature set — see note)
         "month_sin":  month_sin,
         "month_cos":  month_cos,
         "total_LCT":  float(lct.max()) if not lct.isna().all() else np.nan,
@@ -216,20 +223,25 @@ def add_delta_features(reset_df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# split_chrono
+# split_chrono — per-basin chronological TRAIN/VAL (early stopping only)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def add_chronological_split(reset_df: pd.DataFrame) -> pd.DataFrame:
-    """Chronological 70/15/15 per basin. Only split stored in CSV."""
-    reset_df                 = reset_df.copy()
-    reset_df["split_chrono"] = "test"
+    """
+    Per-basin chronological train/val split, used ONLY for LightGBM early
+    stopping. The test set is the held-out basins (chosen at bootstrap
+    runtime), NOT a chronological slice — so there is no 'test' bucket here.
+
+    First TRAIN_FRAC of each basin's resets (oldest) → 'train',
+    the remainder (newest) → 'val'.
+    """
+    reset_df = reset_df.copy()
+    reset_df["split_chrono"] = "val"          # default; train assigned below
     for bn, bdf in reset_df.groupby("basin_number"):
         bdf  = bdf.sort_values("reset_date")
         n    = len(bdf)
         n_tr = max(1, round(n * TRAIN_FRAC))
-        n_va = max(1, round(n * VAL_FRAC))
-        reset_df.loc[bdf.index[:n_tr],          "split_chrono"] = "train"
-        reset_df.loc[bdf.index[n_tr:n_tr+n_va], "split_chrono"] = "val"
+        reset_df.loc[bdf.index[:n_tr], "split_chrono"] = "train"
     print(f"  split_chrono: {reset_df['split_chrono'].value_counts().to_dict()}")
     return reset_df
 
@@ -243,6 +255,9 @@ def main() -> pd.DataFrame:
     print("  BUILD RESET DATASET — pipeline/build_reset_dataset.py")
     print(f"  Target  : {TARGET_M2}")
     print(f"  Features: {MODEL2_FEATURES}")
+    print(f"  Split   : per-basin chronological "
+          f"{int(TRAIN_FRAC*100)}/{int((1-TRAIN_FRAC)*100)} train/val "
+          f"(test = held-out basins, set at bootstrap runtime)")
     print(f"  NOTE: All basins clean — held-out selected at bootstrap runtime")
     print("="*65)
 

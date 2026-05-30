@@ -1,5 +1,5 @@
 """
-figures/fig_bootstrap.py — Bootstrap validation figure (2x2)
+figures/fig4_bootstrap.py — Bootstrap validation figure (2x2)
 =============================================================
 Four-panel figure summarising the 200-iteration bootstrap:
 
@@ -268,6 +268,7 @@ def main():
     print_paper_summary(results, best)
     plot_figure(results, best, selected_iter)
     print("\nDone.")
+    print("Figure 4. Bootstrap validation metrics across 501 random iterations with 5 held-out basins per selection. Histograms illustrate performance distributions for Model 1 (within-segment decay; left) and Model 2 (post-tillage recovery; right). (Top) Pooled $R^2$ distributions; Model 1 achieved a median $R^2$ of 0.746 (IQR: 0.686–0.797) and Model 2 achieved a median $R^2$ of 0.732 (IQR: 0.631–0.798). (Bottom) RMSE improvement over the naive baseline ($\text{RMSE}_{\text{naive}} - \text{RMSE}_{\text{model}}$, cm/h); values greater than 0 indicate superior model performance. Gray dashed lines denote medians, dotted black lines denote the zero-improvement threshold, and gold stars ($\bigstar$) indicate the selected baseline run (Iteration 113: Model 1 $R^2 = 0.773$, $\Delta\text{RMSE} = 1.593$ cm/h; Model 2 $R^2 = 0.796$, $\Delta\text{RMSE} = 0.095$ cm/h).")
 
 
 if __name__ == "__main__":

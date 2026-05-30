@@ -1,11 +1,20 @@
 """
 models/model2_reset.py — Model 2: post-tillage IRD recovery prediction
 =======================================================================
-Reads held-out basins from data/selected_basins.csv (written by bootstrap).
+Reads held-out basins from config.SELECTED_BASINS_CSV (written by bootstrap).
 Trains E-full configuration and evaluates on those 5 basins.
 
-Features: Set-D (12 features, bootstrap-validated).
-Run experiments/run_bootstrap.py first to generate selected_basins.csv.
+Features: 12-feature set (bootstrap-validated, see pipeline/features.py).
+
+Splits
+------
+  Train : non-held-out basins, resets with split_chrono == 'train'
+  Val   : non-held-out basins, resets with split_chrono == 'val'  (DISJOINT;
+          early stopping only)
+  Test  : the 5 held-out basins
+
+Run experiments/run_bootstrap_v2.py first, then point config.SELECTED_BASINS_CSV
+at its output.
 
 Usage
 -----
@@ -29,7 +38,7 @@ warnings.filterwarnings("ignore")
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import (
-    RESET_CSV, OUTLIER_CSV, SELECTED_BASINS_CSV, TABLES_DIR,
+    RESET_CSV, SELECTED_BASINS_CSV, TABLES_DIR,
     FIELD_NAMES, BOOSTING_PARAMS_M2, EARLY_STOPPING_ROUNDS_M2,
 )
 from pipeline.features import MODEL2_FEATURES, TARGET_M2
@@ -49,7 +58,8 @@ def load_selected_basins() -> list[int]:
     if not SELECTED_BASINS_CSV.exists():
         raise FileNotFoundError(
             f"{SELECTED_BASINS_CSV} not found.\n"
-            "Run: python -m experiments.run_bootstrap"
+            "Run: python -m experiments.run_bootstrap_v2  (then point "
+            "config.SELECTED_BASINS_CSV at its output)"
         )
     basins = []
     with open(SELECTED_BASINS_CSV) as f:
@@ -141,16 +151,24 @@ def prepare_splits(
     held_out: list[int],
     feat_cols:list[str],
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """E-full: train on all non-held-out basins."""
+    """
+    E-full: train on non-held-out basins.
+
+    Train : non-held-out, split_chrono == 'train'
+    Val   : non-held-out, split_chrono == 'val'   (DISJOINT — early stopping only)
+    Test  : held-out basins
+    """
     held_set  = set(held_out)
     required  = feat_cols + [TARGET_M2, "prev_IRD_at_reset_raw", "IRD_at_reset"]
     avail_req = [c for c in required if c in df.columns]
 
-    test  = df[df["basin_number"].isin(held_set)].dropna(
+    test   = df[df["basin_number"].isin(held_set)].dropna(
         subset=avail_req).reset_index(drop=True)
-    non_ho= df[~df["basin_number"].isin(held_set)]
-    train = non_ho.dropna(subset=avail_req).reset_index(drop=True)
-    val   = non_ho[non_ho["split_chrono"]=="val"].dropna(
+    non_ho = df[~df["basin_number"].isin(held_set)]
+
+    train = non_ho[non_ho["split_chrono"] == "train"].dropna(
+        subset=avail_req).reset_index(drop=True)
+    val   = non_ho[non_ho["split_chrono"] == "val"].dropna(
         subset=avail_req).reset_index(drop=True)
 
     print(f"  train={len(train)} ({non_ho['basin_number'].nunique()} basins)  "
@@ -201,7 +219,7 @@ def evaluate_held_out(
     test["ird_naive"]= prev_ird
 
     print(f"\n{'='*70}")
-    print("  HELD-OUT RESULTS — Model 2 (E-full, Set-D)")
+    print("  HELD-OUT RESULTS — Model 2 (E-full)")
     print(f"{'='*70}")
     print(f"  {'Basin':>7}  {'Field':<12}  {'n':>5}  "
           f"{'R²':>8}  {'RMSE':>8}  {'MAPE%':>7}  "
@@ -261,7 +279,7 @@ def plot_timeseries(test: pd.DataFrame, held_out: list[int]) -> None:
                              gridspec_kw={"hspace": 0.35})
     if n == 1: axes = [axes]
     fig.suptitle(
-        "Model 2 — Held-out time series (E-full, Set-D)\n"
+        "Model 2 — Held-out time series (E-full)\n"
         "Circles = actual  |  Crosses = predicted  |  Grey = naive",
         fontsize=10, fontweight="bold")
 
@@ -324,7 +342,7 @@ def plot_scatter(test: pd.DataFrame, held_out: list[int]) -> None:
     fig, axes = plt.subplots(1, n, figsize=(4.5*n, 5), squeeze=False)
     axes = axes[0]
     fig.suptitle(
-        "Model 2 — Actual vs predicted IRD_reset (E-full, Set-D)\n"
+        "Model 2 — Actual vs predicted IRD_reset (E-full)\n"
         "Circles = Model 2  |  Triangles = Naive  |  Dashed = 1:1",
         fontsize=10, fontweight="bold")
 
@@ -399,7 +417,7 @@ def plot_shap(
     shap_df = pd.DataFrame(Xte, columns=feat_cols)
     plt.figure(figsize=(10, max(4, len(feat_cols)*0.9)))
     shap.summary_plot(shap_values, shap_df, show=False, plot_size=None)
-    plt.title(f"SHAP beeswarm — Model 2 (E-full, Set-D)\n"
+    plt.title(f"SHAP beeswarm — Model 2 (E-full)\n"
               f"n={len(test)}  |  Positive SHAP → higher recovery",
               fontsize=9, fontweight="bold")
     plt.tight_layout()
@@ -427,7 +445,7 @@ def main():
     print("  MODEL 2 — Post-tillage IRD recovery prediction")
     print(f"  Target   : {TARGET_M2}")
     print(f"  Features : {MODEL2_FEATURES}")
-    print("  Config   : E-full (all non-held-out basins including outliers)")
+    print("  Config   : E-full — non-held-out basins, disjoint train/val")
     print("="*65)
 
     held_out  = load_selected_basins()

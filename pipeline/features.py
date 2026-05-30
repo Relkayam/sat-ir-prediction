@@ -7,25 +7,18 @@ Single source of truth for:
   - Log transforms (LOG_TRANSFORM)
   - Feature preparation function (prepare_features)
 
-PRIMARY EVALUATION CONDITION: Condition E
-  Train : 45 non-held-out basins (37 clean + 8 outliers), all data,
-          no quality filtering of any kind
-  Test  : 5 completely unseen held-out basins (one per field),
-          fixed before any model training
+PRIMARY EVALUATION CONDITION: Condition E (E-full)
+  Train : non-held-out basins, all events that pass the four sensor-quality
+          filters (IRD_R² ≥ 0.94, CIV ≥ 3000, Ct ≥ 20, AL ≥ 5).
+          No segment-level quality gate of any kind.
+  Test  : the held-out basins (one per field), selected at bootstrap runtime.
 
-  Model 1 held-out results (Condition E, E-full):
-    Pooled: R²=+0.861, RMSE=0.663 cm/h, MAPE=15.1% (n=2,504 events)
-    Basin 3203 (Soreq 2): R²=+0.565, RMSE=0.996 cm/h, MAPE=14.7%
-    Basin 4104 (Yavne 1): R²=+0.657, RMSE=0.208 cm/h, MAPE=13.4%
-    Basin 5102 (Yavne 2): R²=+0.670, RMSE=0.590 cm/h, MAPE=16.1%
-    Basin 6303 (Yavne 3): R²=+0.733, RMSE=0.408 cm/h, MAPE=14.2%
-    Basin 7201 (Yavne 4): R²=+0.808, RMSE=0.158 cm/h, MAPE=16.7%
-
-  Model 2 bootstrap validation (200 random held-out selections):
-    Old-3  (3 feat):  beats naive  15.0%  median ΔRMSE=−0.027
-    New-16 (16 feat): beats naive  44.0%  median ΔRMSE=−0.005
-    Set-C  (10 feat): beats naive  34.0%  median ΔRMSE=−0.010
-    Set-D  (12 feat): beats naive  83.5%  median ΔRMSE=+0.031  ← WINNER
+  NOTE ON NUMBERS:
+  No performance figures, SHAP magnitudes, feature-selection RMSE paths, or
+  bootstrap beat-rates are recorded in this file. They are recomputed every
+  run and live in the output tables (outputs/tables/*.xlsx) and in the paper.
+  Numbers duplicated in source comments drift out of date — so they are not
+  kept here.
 
 ─────────────────────────────────────────────────────────────────────────────
 Feature naming conventions
@@ -35,7 +28,7 @@ Feature naming conventions
   mean_*     segment-level mean (Model 2 reset dataset)
   sum_*      segment-level sum (Model 2 reset dataset)
   last_*     value from the final event of the segment (Model 2 only)
-  log1p_*    log(1 + x) transform applied to a skewed column
+  log1p_*    log(1 + x) transform applied to a right-skewed column
 
 ─────────────────────────────────────────────────────────────────────────────
 Operational variables
@@ -63,25 +56,20 @@ Weather variables
   DAR  Daily Average Radiation at event date
 
 ─────────────────────────────────────────────────────────────────────────────
-SHAP findings — for reference
+Modelling notes — for reference
 ─────────────────────────────────────────────────────────────────────────────
-  Model 1 top 4 (stable across conditions):
-    1. IRD_at_reset    mean|SHAP|=0.183  scale anchor
-    2. prev_ALPHA      mean|SHAP|=0.178  drying fraction → less decay
-    3. prev_DrT        mean|SHAP|=0.108  see collinearity note below
-    4. log1p_prev_HL   mean|SHAP|=0.081  hydraulic load → more clogging
+  prev_DrT collinearity note (IMPORTANT — do NOT remove prev_DrT):
+    SHAP shows high prev_DrT associated with faster decay, which looks like a
+    contradiction. It is a collinearity artifact: prev_DrT and prev_ALPHA are
+    strongly correlated, and the unconditional prev_DrT–η relation has the
+    physically correct (positive) sign. Full analysis in Discussion + SI.
 
-  prev_DrT collinearity note (IMPORTANT):
-    SHAP shows high prev_DrT → faster decay (apparent contradiction).
-    This is a collinearity artifact: Spearman r(prev_DrT, prev_ALPHA) = 0.79.
-    Unconditional r(prev_DrT, η) = +0.18 — physically correct direction.
-    Full analysis in Discussion + SI. Do NOT remove prev_DrT.
-
-  Model 2 Set-D (12 features, bootstrap-validated):
-    Key finding: scale-free autocorrelation (prev_delta, prev_prev_delta)
-    generalizes to unseen basins. Raw prev_IRD_at_reset hurts held-out
-    performance — log-ratio normalization removes between-basin scale.
-    Radiation features carry seasonal signal without month encoding.
+  Model 2 design rationale:
+    prev_delta / prev_prev_delta are scale-free (dimensionless log-ratios) and
+    generalize to unseen basins, unlike raw prev_IRD_at_reset which carries
+    between-basin scale and hurts held-out performance. Radiation features
+    carry the seasonal signal in physical units, so explicit month encoding is
+    redundant and is not used in the final set.
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -104,24 +92,15 @@ LOG_TRANSFORM = {
 # ─────────────────────────────────────────────────────────────────────────────
 # Model 1 features — FINAL SET (11 features)
 # ─────────────────────────────────────────────────────────────────────────────
-# Selected by unconstrained forward stepwise, Condition E.
-# Metric: RMSE on raw IRD (cm/h) on 5 held-out test basins.
-#
-# Selection path (held-out RMSE):
-#    5 features:  0.7193 cm/h
-#    6 features:  0.6936 cm/h  +prev_TD    Δ=+0.026 ✓
-#    7 features:  0.6794 cm/h  +prev_FT    Δ=+0.014 ✓
-#    8 features:  0.6679 cm/h  +cum_TW     Δ=+0.012 ✓
-#    9 features:  0.6659 cm/h  +cum_FT     Δ=+0.002 ✓
-#   10 features:  0.6504 cm/h  +prev_RD    Δ=+0.016 ✓
-#   11 features:  0.6491 cm/h  +prev_RW    Δ=+0.001 ✓  ← BEST
-#   12 features:  0.6582 cm/h  +cum_TD     Δ=-0.009 ✗  STOP
+# Selected by unconstrained forward stepwise selection on held-out RMSE
+# (raw IRD, cm/h). The selection curve is regenerated by the selection script
+# and reported in Figure S2 — not duplicated here.
 
 MODEL1_RAW_FEATURES = [
     "IRD_at_reset",   # scale anchor — basin hydraulic conductivity ceiling
     "prev_ALPHA",     # drying fraction = DrT/Ct — primary recovery driver
-    "prev_HL",        # → log1p_prev_HL at runtime (skewness=15.5)
-    "prev_DrT",       # drying time (collinear with ALPHA — see SHAP note)
+    "prev_HL",        # → log1p_prev_HL at runtime (right-skewed)
+    "prev_DrT",       # drying time (collinear with ALPHA — see note above)
     "prev_TD",        # temperature during previous drying phase
     "prev_RD",        # radiation during previous drying (photodegradation)
     "prev_RW",        # radiation during previous wetting phase
@@ -137,21 +116,10 @@ MODEL1_FEATURES = [
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Model 2 features — FINAL SET (12 features, Set-D)
+# Model 2 features — FINAL SET (12 features)
 # ─────────────────────────────────────────────────────────────────────────────
-# Selected by bootstrap validation (200 random held-out iterations).
-# Metric: pooled RMSE on 5 random held-out basins, 35-basin eligible pool.
-#
-# Bootstrap beat rate vs naive:
-#   Old-3  (month_sin, month_cos, total_LCT)  : 15.0%  ← previous model
-#   Set-D  (12 features below)                : 83.5%  ← current model
-#
-# Design rationale:
-#   Radiation features carry seasonal signal in physical units — month
-#   encoding is redundant and hurts generalization across the bootstrap pool.
-#   prev_delta and prev_prev_delta are scale-free (dimensionless log-ratios)
-#   and generalize to unseen basins, unlike raw prev_IRD_at_reset which
-#   carries between-basin scale and consistently hurts held-out performance.
+# Selected by bootstrap validation. See the design rationale in the header
+# docstring. Beat-rates and ΔRMSE are regenerated each run, not stored here.
 
 MODEL2_FEATURES = [
     # ── Operational — segment load and drying quality ──────────────────────
