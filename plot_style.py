@@ -52,13 +52,15 @@ FIELD_COLORS = {
 }
 
 # Held-out basin markers — one per field, consistent across M1 and M2 figures
+
 HELD_OUT_MARKERS = {
-    3203: ("o", FIELD_COLORS["Soreq 2"], "Basin 3203 — Soreq 2"),
-    4104: ("s", FIELD_COLORS["Yavne 1"], "Basin 4104 — Yavne 1"),
-    5102: ("^", FIELD_COLORS["Yavne 2"], "Basin 5102 — Yavne 2"),
-    6303: ("D", FIELD_COLORS["Yavne 3"], "Basin 6303 — Yavne 3"),
-    7201: ("P", FIELD_COLORS["Yavne 4"], "Basin 7201 — Yavne 4"),
+    3201: ("o", FIELD_COLORS["Soreq 2"], "Basin 3201 — Soreq 2"),
+    4103: ("s", FIELD_COLORS["Yavne 1"], "Basin 4103 — Yavne 1"),
+    5101: ("^", FIELD_COLORS["Yavne 2"], "Basin 5101 — Yavne 2"),
+    6302: ("D", FIELD_COLORS["Yavne 3"], "Basin 6302 — Yavne 3"),
+    7302: ("P", FIELD_COLORS["Yavne 4"], "Basin 7302 — Yavne 4"),
 }
+
 
 # Split colors (train/val/test) — used in per-basin diagnostic plots
 SPLIT_COLORS = {
@@ -330,14 +332,33 @@ def add_unity_line(ax, color=None, lw=1.5):
 
 import matplotlib.cm as cm
 
+import colorsys
+
+def _build_segment_palette(n=100, seed=42):
+    """
+    n distinct colors sharing the house style: full hue variety, but
+    saturation/value clamped to the muted, mid-deep range of COLORS
+    (S 0.45-0.70, V 0.55-0.80 — no neon, no pastel). Shuffled with a fixed
+    seed so chronologically adjacent segments contrast. Built once.
+    """
+    base = []
+    for i in range(n):
+        h = (i / n)
+        s = 0.45 + 0.25 * ((i * 7) % n) / n      # 0.45-0.70, decorrelated from hue
+        v = 0.80 - 0.25 * ((i * 13) % n) / n     # 0.55-0.80
+        base.append(colorsys.hsv_to_rgb(h, s, v))
+    order = np.random.default_rng(seed).permutation(n)
+    return [base[k] for k in order]
+
+SEGMENT_PALETTE = _build_segment_palette(100, seed=42)
+
 def segment_colors(n_segments):
     """
-    Return a list of n_segments colors using the 'viridis' colormap.
-    Used in Figure 2 to color each flooding segment distinctly.
+    Return n_segments colors from the shared house-style cycling palette
+    (SEGMENT_PALETTE). Cycles back to the first color after 100 segments.
+    Used wherever segments within a basin are colored (e.g. Figure 2).
     """
-    cmap = plt.colormaps["viridis"].resampled(max(n_segments, 2))
-    return [cmap(i / max(n_segments - 1, 1)) for i in range(n_segments)]
-
+    return [SEGMENT_PALETTE[i % len(SEGMENT_PALETTE)] for i in range(n_segments)]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # QUICK SELF-TEST

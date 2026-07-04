@@ -49,7 +49,7 @@ EVENT_CSV             = DATA_DIR / "event_dataset.csv"
 RESET_CSV             = DATA_DIR / "reset_dataset.csv"
 OUTLIER_CSV           = DATA_DIR / "outlier_basins.csv"
 BOOTSTRAP_RESULTS_CSV = DATA_DIR / "bootstrap_results.csv"
-SELECTED_BASINS_CSV   = DATA_DIR / "selected_basins.csv"
+SELECTED_BASINS_CSV   = DATA_DIR / "selected_basins_v2.csv"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -99,7 +99,7 @@ OUTLIER_REL_RMSE_THRESHOLD = 1.0
 # ─────────────────────────────────────────────────────────────────────────────
 # Bootstrap settings
 # ─────────────────────────────────────────────────────────────────────────────
-BOOTSTRAP_N_ITERATIONS = 200
+BOOTSTRAP_N_ITERATIONS = 500
 BOOTSTRAP_N_HELD_OUT   = 5
 BOOTSTRAP_SEED         = RANDOM_SEED
 
@@ -107,36 +107,36 @@ BOOTSTRAP_SEED         = RANDOM_SEED
 # ─────────────────────────────────────────────────────────────────────────────
 # LightGBM hyperparameters
 # ─────────────────────────────────────────────────────────────────────────────
-BOOSTING_PARAMS_M1 = dict(
-    n_estimators      = 1000,
-    max_depth         = -1,
-    num_leaves        = 63,
-    learning_rate     = 0.05,
-    subsample         = 0.8,
-    feature_fraction  = 0.8,
-    min_child_samples = 20,
-    reg_alpha         = 0.1,
-    reg_lambda        = 1.0,
-    random_state      = RANDOM_SEED,
-    n_jobs            = -1,
-    verbose           = -1,
-)
-EARLY_STOPPING_ROUNDS_M1 = 50
 
-BOOSTING_PARAMS_M2 = dict(
-    n_estimators      = 1000,
-    max_depth         = -1,
-    num_leaves        = 31,
-    learning_rate     = 0.05,
-    subsample         = 0.8,
-    feature_fraction  = 0.8,
-    min_child_samples = 10,
-    reg_alpha         = 0.1,
-    reg_lambda        = 1.0,
-    random_state      = RANDOM_SEED,
-    n_jobs            = -1,
-    verbose           = -1,
+import json as _json
+
+# Fallback defaults — used only until tune_hyperparams.py writes the JSONs.
+_FALLBACK_M1 = dict(
+    n_estimators=1000, max_depth=-1, num_leaves=63, learning_rate=0.05,
+    subsample=0.8, feature_fraction=0.8, min_child_samples=20,
+    reg_alpha=0.1, reg_lambda=1.0, random_state=RANDOM_SEED,
+    n_jobs=-1, verbose=-1,
 )
+_FALLBACK_M2 = dict(
+    n_estimators=1000, max_depth=-1, num_leaves=31, learning_rate=0.05,
+    subsample=0.8, feature_fraction=0.8, min_child_samples=10,
+    reg_alpha=0.1, reg_lambda=1.0, random_state=RANDOM_SEED,
+    n_jobs=-1, verbose=-1,
+)
+
+def _load_params(path: Path, fallback: dict) -> dict:
+    if path.exists():
+        with open(path) as f:
+            p = _json.load(f)
+        p.setdefault("random_state", RANDOM_SEED)
+        p.setdefault("n_jobs", -1)
+        p.setdefault("verbose", -1)
+        return p
+    return fallback
+
+BOOSTING_PARAMS_M1 = _load_params(DATA_DIR / "best_params_m1.json", _FALLBACK_M1)
+BOOSTING_PARAMS_M2 = _load_params(DATA_DIR / "best_params_m2.json", _FALLBACK_M2)
+EARLY_STOPPING_ROUNDS_M1 = 50
 EARLY_STOPPING_ROUNDS_M2 = 50
 
 

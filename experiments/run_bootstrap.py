@@ -1,31 +1,37 @@
 """
-experiments/run_bootstrap_v2.py — Bootstrap validation + basin selection (v2)
+experiments/run_bootstrap_v2.py - Bootstrap validation + basin selection (v2)
 ==============================================================================
-Runs (1 hardcoded + N random) iterations for BOTH Model 1 and Model 2.
-N is read from config.BOOTSTRAP_N_ITERATIONS.
+Runs N random draws for BOTH Model 1 and Model 2. N is read from
+config.BOOTSTRAP_N_ITERATIONS.
 
-Iteration structure
--------------------
-  Iteration 1      : HARDCODED — basins [3203, 4401, 5302, 6302, 7402]
-                     Safety-net candidate, guaranteed evaluated.
-  Iterations 2…N+1 : N random draws from all 50 basins, each constrained to
-                     include one basin from each of the 5 operational fields
-                     (fields 3,4,5,6,7). Outliers are NOT excluded.
+Each draw selects one basin from each of the 5 operational fields
+(fields 3,4,5,6,7) from all 50 basins; outliers are NOT excluded. In every
+draw both models are trained on the 45 non-held-out basins and evaluated on
+the 5 held-out basins.
 
-Selection criterion (switchable — see CONFIG block)
+Selection criterion (switchable - see CONFIG block)
 ---------------------------------------------------
   Qualifying set:
-    (optional) all 5 held-out basins beat naive in BOTH models
-    AND one basin per field.
+    (optional) all 5 held-out basins beat naive in BOTH models.
+    (Every draw is one-per-field by construction.)
   Objective among qualifiers:
-    "median" : the qualifier whose Model 2 ΔRMSE is CLOSEST to the median of
+    "median" : the qualifier whose Model 2 dRMSE is CLOSEST to the median of
                the FULL bootstrap distribution (a representative draw).
-    "max"    : the qualifier with the largest Model 2 ΔRMSE (best case).
+    "max"    : the qualifier with the largest Model 2 dRMSE (best case).
+
+SHAP (optional - COMPUTE_SHAP)
+------------------------------
+  When True, every draw also records per-feature importance (mean|SHAP|) and
+  direction (corr of feature value vs SHAP value) on its held-out set, using
+  the SAME draws as the performance bootstrap. Writes bootstrap_shap_*.csv,
+  consumed by figures/fig7_bootstrap_shap.py.
 
 Outputs
 -------
   data/bootstrap_results_v2.csv
   data/selected_basins_v2.csv
+  data/bootstrap_shap_m1.csv, bootstrap_shap_m1_dir.csv   (if COMPUTE_SHAP)
+  data/bootstrap_shap_m2.csv, bootstrap_shap_m2_dir.csv   (if COMPUTE_SHAP)
   outputs/figures/bootstrap_distribution_v2.png
 
 Usage
@@ -61,42 +67,45 @@ from pipeline.features import (
     MODEL2_FEATURES, TARGET_M2,
 )
 from models.model1_decay import _linear_extrap_baseline
+from experiments.bootstrap_shap import shap_row, write_shap_csvs   # SHAP
 
-# ══════════════════════════════════════════════════════════════════════════════
-# CONFIG — selection criterion (edit here)
-# ══════════════════════════════════════════════════════════════════════════════
-# "median" → report the qualifying draw whose Model 2 ΔRMSE is closest to the
+# ==============================================================================
+# CONFIG - selection criterion (edit here)
+# ==============================================================================
+# "median" -> report the qualifying draw whose Model 2 dRMSE is closest to the
 #            median of the FULL bootstrap distribution (a representative result).
-# "max"    → report the qualifying draw with the largest Model 2 ΔRMSE (best case).
+# "max"    -> report the qualifying draw with the largest Model 2 dRMSE (best case).
 SELECTION_OBJECTIVE        = "median"
 
 # Require all 5 held-out basins to beat naive in BOTH models to qualify.
 SELECTION_REQUIRE_BEAT_ALL = True
-# ══════════════════════════════════════════════════════════════════════════════
+
+# SHAP - compute per-draw SHAP importance + direction on each held-out set.
+# Adds ~1-2 s per draw and writes bootstrap_shap_*.csv. Set False to disable.
+COMPUTE_SHAP = True
+# ==============================================================================
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 # v2 output paths  (separate from v1)
-# ─────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 DATA_DIR             = Path(__file__).parent.parent / "data"
 BOOTSTRAP_RESULTS_V2 = DATA_DIR    / "bootstrap_results_v2.csv"
 SELECTED_BASINS_V2   = DATA_DIR    / "selected_basins_v2.csv"
 BOOTSTRAP_FIGURE_V2  = FIGURES_DIR / "bootstrap_distribution_v2.png"
 
-# Number of RANDOM draws comes from config (single source of truth).
-N_RANDOM_ITERATIONS = int(BOOTSTRAP_N_ITERATIONS)
-N_TOTAL_ITERATIONS  = N_RANDOM_ITERATIONS + 1  # +1 hardcoded safety net
+# Number of random draws comes from config (single source of truth).
+N_DRAWS = int(BOOTSTRAP_N_ITERATIONS)
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 # Constants
-# ─────────────────────────────────────────────────────────────────────────────
-HARDCODED_HELD_OUT = [3203, 4401, 5302, 6302, 7402]
-REQUIRED_FIELDS    = {3, 4, 5, 6, 7}   # first digit of basin number
+# ------------------------------------------------------------------------------
+REQUIRED_FIELDS = {3, 4, 5, 6, 7}   # first digit of basin number
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 # Helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 
 def _rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     mask = (np.isfinite(y_true) & np.isfinite(y_pred) &
@@ -128,26 +137,17 @@ def _covers_all_fields(held_out_str: str) -> bool:
 def _draw_one_per_field(
     eligible_by_field: dict[int, list[int]],
     rng: np.random.Generator,
-    exclude: list[int],
 ) -> list[int]:
-    """
-    Draw exactly one basin per field from the eligible pool.
-    Retries until the draw does not match `exclude`.
-    """
-    exclude_sorted = sorted(exclude)
-    for _ in range(10_000):
-        draw = sorted([
-            int(rng.choice(basins))
-            for basins in eligible_by_field.values()
-        ])
-        if draw != exclude_sorted:
-            return draw
-    raise RuntimeError("Could not draw a valid one-per-field set after 10,000 attempts.")
+    """Draw exactly one basin per field from the eligible pool."""
+    return sorted([
+        int(rng.choice(basins))
+        for basins in eligible_by_field.values()
+    ])
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 # Load data
-# ─────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 
 def load_outlier_basins() -> set[int]:
     if not OUTLIER_CSV.exists():
@@ -203,12 +203,12 @@ def build_eligible_pool(
       eligible          : sorted list of all basin numbers (outliers included)
       eligible_by_field : {field_digit: [basin_numbers]} for one-per-field draws
 
-    NOTE: All 50 basins are eligible — outliers are NOT excluded from the draw.
+    NOTE: All 50 basins are eligible - outliers are NOT excluded from the draw.
     Outlier basins are included in training (E-full) and can be held out.
     The outlier list is kept for logging only.
     """
     all_bas  = set(event_df["basin_number"].dropna().unique().astype(int))
-    eligible = sorted(all_bas)   # all basins — no outlier exclusion
+    eligible = sorted(all_bas)   # all basins - no outlier exclusion
 
     eligible_by_field: dict[int, list[int]] = {}
     for bn in eligible:
@@ -226,20 +226,12 @@ def build_eligible_pool(
             f"Fields {missing_fields} have no eligible basins. "
             "One-per-field draws are impossible."
         )
-
-    all_basin_set = set(eligible)
-    missing_hc = [bn for bn in HARDCODED_HELD_OUT if bn not in all_basin_set]
-    if missing_hc:
-        raise ValueError(
-            f"Hardcoded basins {missing_hc} not found in event dataset."
-        )
-    print(f"  Hardcoded basins verified: {HARDCODED_HELD_OUT}")
     return eligible, eligible_by_field
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 # One Model 1 iteration
-# ─────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 
 def run_m1_one(
     event_df:  pd.DataFrame,
@@ -261,10 +253,7 @@ def run_m1_one(
         (event_df["row_type"] == "event")
     ].dropna(subset=required)
 
-    # ── DISJOINT train / val (no val-in-train leak) ───────────────────────────
-    # train = split=='train', val = split=='val'. The split column is the
-    # segment-level 80/20 partition baked into event_dataset.csv. val is used
-    # ONLY for early stopping and shares no rows with train.
+    # -- DISJOINT train / val (no val-in-train leak) ---------------------------
     train = non_ho[non_ho["split"] == "train"].reset_index(drop=True)
     val   = non_ho[non_ho["split"] == "val"].reset_index(drop=True)
 
@@ -293,7 +282,6 @@ def run_m1_one(
         pd.to_numeric(test[TARGET_M1], errors="coerce").values)
     ird_naive = ird_reset
 
-    # Linear baseline — causal per-event regression on prior events in segment
     ird_linear = _linear_extrap_baseline(test)
 
     per_basin = {}
@@ -323,12 +311,14 @@ def run_m1_one(
                             if np.isfinite(rmse_linear) else np.nan,
         all_beat    = all(v["beats"] for v in per_basin.values()),
         per_basin   = per_basin,
+        _model      = model,        # SHAP - trained model
+        _X_test     = Xte,          # SHAP - scaled held-out matrix
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 # One Model 2 iteration
-# ─────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 
 def run_m2_one(
     reset_df: pd.DataFrame,
@@ -345,9 +335,7 @@ def run_m2_one(
     non_ho = reset_df[~reset_df["basin_number"].isin(held_set)].dropna(
         subset=required)
 
-    # ── DISJOINT train / val (no val-in-train leak) ───────────────────────────
-    # train = split_chrono=='train' (oldest 80% per basin),
-    # val   = split_chrono=='val'   (newest 20% per basin), early stopping only.
+    # -- DISJOINT train / val (no val-in-train leak) ---------------------------
     train = non_ho[non_ho["split_chrono"] == "train"].reset_index(drop=True)
     val   = non_ho[non_ho["split_chrono"] == "val"].reset_index(drop=True)
 
@@ -393,25 +381,25 @@ def run_m2_one(
         delta_rmse = rmse_naive - rmse_pool,
         all_beat   = all(v["beats"] for v in per_basin.values()),
         per_basin  = per_basin,
+        _model     = model,         # SHAP - trained model
+        _X_test    = Xte,           # SHAP - scaled held-out matrix
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 # Build one result row
-# ─────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 
 def _build_row(
     iteration: int,
     held_out:  list[int],
     m1:        dict,
     m2:        dict,
-    hardcoded: bool,
 ) -> dict:
     both_all_beat = m1["all_beat"] and m2["all_beat"]
     row = dict(
         iteration           = iteration,
         held_out            = str(sorted(held_out)),
-        hardcoded           = hardcoded,
         m1_rmse             = m1["rmse_pool"],
         m1_rmse_naive       = m1["rmse_naive"],
         m1_rmse_linear      = m1.get("rmse_linear", np.nan),
@@ -438,9 +426,9 @@ def _build_row(
     return row
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Run all iterations
-# ─────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
+# Run all draws
+# ------------------------------------------------------------------------------
 
 def run_bootstrap(
     event_df:          pd.DataFrame,
@@ -451,60 +439,70 @@ def run_bootstrap(
     rng  = np.random.default_rng(BOOTSTRAP_SEED)
     rows = []
 
-    print(f"\n  Total iterations : {N_TOTAL_ITERATIONS} "
-          f"(1 hardcoded + {N_RANDOM_ITERATIONS} random one-per-field)")
-    print()
-    print(f"  {'Iter':>5}  {'Type':<12}  {'M1 RMSE':>9}  {'M2 RMSE':>9}  "
-          f"{'ΔM1':>8}  {'ΔM2':>8}  {'M1✓':>4}  {'M2✓':>4}  {'Both✓':>6}")
-    print(f"  {'-'*88}")
+    # SHAP - per-draw accumulators
+    m1_imp_rows, m1_dir_rows = [], []
+    m2_imp_rows, m2_dir_rows = [], []
+    feat_cols_m2 = [f for f in MODEL2_FEATURES if f in reset_df.columns]
 
-    def _run_and_log(iteration: int, held_out: list[int], label: str) -> None:
+    print(f"\n  Total draws : {N_DRAWS} (random one-per-field)")
+    if COMPUTE_SHAP:
+        print(f"  SHAP        : ON (writing bootstrap_shap_*.csv)")
+    print()
+    print(f"  {'Draw':>5}  {'M1 RMSE':>9}  {'M2 RMSE':>9}  "
+          f"{'dM1':>8}  {'dM2':>8}  {'M1 ok':>5}  {'M2 ok':>5}  {'Both':>5}")
+    print(f"  {'-'*76}")
+
+    for i in range(N_DRAWS):
+        iteration = i + 1
+        held_out  = _draw_one_per_field(eligible_by_field, rng)
+
         m1 = run_m1_one(event_df, feat_cols_m1, held_out)
         m2 = run_m2_one(reset_df, held_out)
         if not m1 or not m2:
-            return
-        is_hc = (label == "HARDCODED")
-        row   = _build_row(iteration, held_out, m1, m2, hardcoded=is_hc)
+            continue
+        row = _build_row(iteration, held_out, m1, m2)
         rows.append(row)
 
-        show = (is_hc or iteration <= 3 or
-                iteration % 50 == 0 or iteration == N_TOTAL_ITERATIONS)
-        if show:
-            print(f"  {iteration:>5}  {label:<12}  "
+        if COMPUTE_SHAP:
+            i1, d1 = shap_row(m1.get("_model"), m1.get("_X_test"),
+                              feat_cols_m1, iteration)
+            if i1 is not None:
+                m1_imp_rows.append(i1); m1_dir_rows.append(d1)
+            i2, d2 = shap_row(m2.get("_model"), m2.get("_X_test"),
+                              feat_cols_m2, iteration)
+            if i2 is not None:
+                m2_imp_rows.append(i2); m2_dir_rows.append(d2)
+
+        if (iteration <= 3 or iteration % 50 == 0 or iteration == N_DRAWS):
+            print(f"  {iteration:>5}  "
                   f"{m1['rmse_pool']:>9.4f}  {m2['rmse_pool']:>9.4f}  "
                   f"{m1['delta_rmse']:>+8.4f}  {m2['delta_rmse']:>+8.4f}  "
-                  f"{'✓' if m1['all_beat'] else '✗':>4}  "
-                  f"{'✓' if m2['all_beat'] else '✗':>4}  "
-                  f"{'✓' if row['both_all_beat'] else '✗':>6}")
+                  f"{'Y' if m1['all_beat'] else 'n':>5}  "
+                  f"{'Y' if m2['all_beat'] else 'n':>5}  "
+                  f"{'Y' if row['both_all_beat'] else 'n':>5}")
 
-    # ── Iteration 1: hardcoded ────────────────────────────────────────────────
-    _run_and_log(1, HARDCODED_HELD_OUT, "HARDCODED")
-
-    # ── Iterations 2…N+1: random one-per-field ────────────────────────────────
-    for i in range(N_RANDOM_ITERATIONS):
-        iteration = i + 2
-        held_out  = _draw_one_per_field(
-            eligible_by_field, rng, exclude=HARDCODED_HELD_OUT)
-        _run_and_log(iteration, held_out, "random-1pf")
+    # SHAP - write the four accumulated tables
+    if COMPUTE_SHAP:
+        print()
+        write_shap_csvs(m1_imp_rows, m1_dir_rows, m2_imp_rows, m2_dir_rows)
 
     return pd.DataFrame(rows)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Select reporting iteration
-# ─────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
+# Select reporting draw
+# ------------------------------------------------------------------------------
 
 def select_best_iteration(results: pd.DataFrame) -> pd.Series:
     """
-    Selection (see CONFIG block at top of file):
-      1. (optional) both models all 5 beat naive   — SELECTION_REQUIRE_BEAT_ALL
-      2. one basin per field                        — always enforced
-      3. objective among qualifiers:
-           "median" → Model 2 ΔRMSE closest to the median of the FULL
+    Selection (see CONFIG block):
+      1. (optional) both models all 5 beat naive   - SELECTION_REQUIRE_BEAT_ALL
+      2. objective among qualifiers:
+           "median" -> Model 2 dRMSE closest to the median of the FULL
                       bootstrap distribution (representative draw)
-           "max"    → largest Model 2 ΔRMSE (best case)
+           "max"    -> largest Model 2 dRMSE (best case)
+    Every draw is one basin per field by construction.
     """
-    # Median is taken over the FULL distribution (all draws, hardcoded included).
     total_median = float(results["m2_delta_rmse"].median())
 
     n_m1   = int(results["m1_all_beat"].sum())
@@ -513,30 +511,20 @@ def select_best_iteration(results: pd.DataFrame) -> pd.Series:
 
     print(f"\n  Selection objective : {SELECTION_OBJECTIVE!r}  "
           f"(require beat-all = {SELECTION_REQUIRE_BEAT_ALL})")
-    print(f"  Full-distribution Model 2 ΔRMSE median : {total_median:+.4f} cm/h")
-    print(f"\n  Iterations where all 5 beat naive:")
+    print(f"  Full-distribution Model 2 dRMSE median : {total_median:+.4f} cm/h")
+    print(f"\n  Draws where all 5 beat naive:")
     print(f"    Model 1 only  : {n_m1}/{len(results)}")
     print(f"    Model 2 only  : {n_m2}/{len(results)}")
     print(f"    BOTH models   : {n_both}/{len(results)}")
 
-    # ── Build qualifying set ──────────────────────────────────────────────────
     qual = results.copy()
     if SELECTION_REQUIRE_BEAT_ALL:
         qual = qual[qual["both_all_beat"] == True].copy()
         if qual.empty:
-            print("\n  WARNING: no iteration has both models beat naive on all 5.")
+            print("\n  WARNING: no draw has both models beat naive on all 5.")
             print("  Relaxing: dropping beat-all constraint.")
             qual = results.copy()
 
-    field_mask = qual["held_out"].apply(_covers_all_fields)
-    n_field    = int(field_mask.sum())
-    print(f"    One per field : {n_field}/{len(qual)}")
-    if n_field > 0:
-        qual = qual[field_mask].copy()
-    else:
-        print("  WARNING: no qualifying iteration covers all 5 fields.")
-
-    # ── Apply objective ───────────────────────────────────────────────────────
     if SELECTION_OBJECTIVE == "median":
         idx = (qual["m2_delta_rmse"] - total_median).abs().idxmin()
     elif SELECTION_OBJECTIVE == "max":
@@ -545,43 +533,39 @@ def select_best_iteration(results: pd.DataFrame) -> pd.Series:
         raise ValueError(
             f"SELECTION_OBJECTIVE must be 'median' or 'max', "
             f"got {SELECTION_OBJECTIVE!r}")
-    best  = qual.loc[idx]
-    is_hc = bool(best.get("hardcoded", False))
+    best = qual.loc[idx]
 
     basin_nums = [int(x) for x in re.findall(r'\b\d{4}\b', str(best["held_out"]))]
     fields_sel = sorted({int(str(bn)[0]) for bn in basin_nums})
 
-    print(f"\n  SELECTED ITERATION : {int(best['iteration'])}"
-          f"{'  ← HARDCODED' if is_hc else ''}")
+    print(f"\n  SELECTED DRAW : {int(best['iteration'])}")
     print(f"    Held-out basins  : {best['held_out']}")
     print(f"    Fields covered   : {fields_sel}")
     print(f"    M1 RMSE={best['m1_rmse']:.4f}  "
-          f"ΔRMSE={best['m1_delta_rmse']:+.4f}  all_beat={best['m1_all_beat']}")
+          f"dRMSE={best['m1_delta_rmse']:+.4f}  all_beat={best['m1_all_beat']}")
     print(f"    M2 RMSE={best['m2_rmse']:.4f}  "
-          f"ΔRMSE={best['m2_delta_rmse']:+.4f}  all_beat={best['m2_all_beat']}")
+          f"dRMSE={best['m2_delta_rmse']:+.4f}  all_beat={best['m2_all_beat']}")
     if SELECTION_OBJECTIVE == "median":
-        print(f"    M2 ΔRMSE distance from median : "
+        print(f"    M2 dRMSE distance from median : "
               f"{abs(best['m2_delta_rmse'] - total_median):.4f} cm/h")
     return best
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 # Write selected_basins_v2.csv
-# ─────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 
 def write_selected_basins(best_row: pd.Series) -> list[int]:
-    held_out  = sorted([int(x) for x in
-                        re.findall(r'\b\d{4}\b', str(best_row["held_out"]))])
-    is_hc     = bool(best_row.get("hardcoded", False))
+    held_out = sorted([int(x) for x in
+                       re.findall(r'\b\d{4}\b', str(best_row["held_out"]))])
 
     lines = [
         "# Auto-generated by experiments/run_bootstrap_v2.py",
-        f"# Bootstrap iteration: {int(best_row['iteration'])}"
-        + (" (HARDCODED)" if is_hc else " (random one-per-field)"),
+        f"# Bootstrap draw: {int(best_row['iteration'])} (random one-per-field)",
         f"# Selection: objective={SELECTION_OBJECTIVE}, "
         f"require_beat_all={SELECTION_REQUIRE_BEAT_ALL}, one basin per field",
-        f"# M1 RMSE={best_row['m1_rmse']:.4f}  ΔRMSE={best_row['m1_delta_rmse']:+.4f}",
-        f"# M2 RMSE={best_row['m2_rmse']:.4f}  ΔRMSE={best_row['m2_delta_rmse']:+.4f}",
+        f"# M1 RMSE={best_row['m1_rmse']:.4f}  dRMSE={best_row['m1_delta_rmse']:+.4f}",
+        f"# M2 RMSE={best_row['m2_rmse']:.4f}  dRMSE={best_row['m2_delta_rmse']:+.4f}",
         "#",
         "# basin_number,field_name",
     ]
@@ -600,14 +584,13 @@ def write_selected_basins(best_row: pd.Series) -> list[int]:
     return held_out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 # Summary
-# ─────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 
 def print_summary(results: pd.DataFrame, best_row: pd.Series) -> None:
     print(f"\n{'='*70}")
-    print(f"  BOOTSTRAP SUMMARY v2 — {len(results)} iterations "
-          f"(1 hardcoded + {len(results)-1} random one-per-field)")
+    print(f"  BOOTSTRAP SUMMARY v2 - {len(results)} random draws (one-per-field)")
     print(f"{'='*70}")
     for model, col_rmse, col_delta, col_beat, col_lin in [
         ("Model 1", "m1_rmse", "m1_delta_rmse", "m1_all_beat", "m1_rmse_linear"),
@@ -619,7 +602,7 @@ def print_summary(results: pd.DataFrame, best_row: pd.Series) -> None:
         print(f"\n  {model}:")
         print(f"    RMSE   median={arr.median():.4f}  "
               f"IQR=[{arr.quantile(0.25):.4f}, {arr.quantile(0.75):.4f}]")
-        print(f"    ΔRMSE  median={delta.median():+.4f}  "
+        print(f"    dRMSE  median={delta.median():+.4f}  "
               f"IQR=[{delta.quantile(0.25):+.4f}, {delta.quantile(0.75):+.4f}]")
         if col_lin and col_lin in results.columns:
             lin = results[col_lin].dropna()
@@ -629,36 +612,27 @@ def print_summary(results: pd.DataFrame, best_row: pd.Series) -> None:
         print(f"    All 5 beat naive: {beats}/{len(results)} "
               f"({100*beats/len(results):.1f}%)")
 
-    both       = int(results["both_all_beat"].sum())
-    field_qual = int(results[results["both_all_beat"] == True]["held_out"]
-                     .apply(_covers_all_fields).sum())
-    is_hc      = bool(best_row.get("hardcoded", False))
-
+    both = int(results["both_all_beat"].sum())
     print(f"\n  Both models all 5 beat naive     : "
           f"{both}/{len(results)} ({100*both/len(results):.1f}%)")
-    print(f"  + one basin per field            : {field_qual}/{both}")
-    print(f"\n  Selected iteration : {int(best_row['iteration'])}"
-          + ("  ← HARDCODED" if is_hc else "  ← random")
-          + f"  (objective={SELECTION_OBJECTIVE})")
+    print(f"\n  Selected draw : {int(best_row['iteration'])}  "
+          f"(objective={SELECTION_OBJECTIVE})")
     print(f"    Basins : {best_row['held_out']}")
-    print(f"    M1 ΔRMSE={best_row['m1_delta_rmse']:+.4f}  "
-          f"M2 ΔRMSE={best_row['m2_delta_rmse']:+.4f}")
+    print(f"    M1 dRMSE={best_row['m1_delta_rmse']:+.4f}  "
+          f"M2 dRMSE={best_row['m2_delta_rmse']:+.4f}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 # Plot histogram
-# ─────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 
 def plot_histogram(results: pd.DataFrame, best_row: pd.Series) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-    is_hc = bool(best_row.get("hardcoded", False))
 
     fig.suptitle(
-        f"Bootstrap validation v2 — {len(results)} iterations "
-        f"(1 hardcoded + {len(results)-1} random one-per-field)\n"
-        f"★ = selected iteration (objective={SELECTION_OBJECTIVE}, "
-        f"require beat-all={SELECTION_REQUIRE_BEAT_ALL}, one basin per field)"
-        + (" [HARDCODED]" if is_hc else ""),
+        f"Bootstrap validation v2 - {len(results)} random draws (one-per-field)\n"
+        f"* = selected draw (objective={SELECTION_OBJECTIVE}, "
+        f"require beat-all={SELECTION_REQUIRE_BEAT_ALL})",
         fontsize=10, fontweight="bold",
     )
 
@@ -688,12 +662,12 @@ def plot_histogram(results: pd.DataFrame, best_row: pd.Series) -> None:
                    s=400, zorder=6, edgecolors="black", linewidths=0.8,
                    label=f"Selected = {sel_val:+.4f}")
 
-        ax.set_xlabel("ΔRMSE = naive − model (cm/h)  ↑ positive = model better",
+        ax.set_xlabel("dRMSE = naive - model (cm/h)  positive = model better",
                       fontsize=9)
         ax.set_ylabel("Count", fontsize=9)
         ax.set_title(
             f"{model}  |  {int(results[col_beat].sum())}/{len(results)} "
-            "iterations: all 5 beat naive",
+            "draws: all 5 beat naive",
             fontsize=9, fontweight="bold",
         )
         ax.legend(fontsize=8)
@@ -705,26 +679,26 @@ def plot_histogram(results: pd.DataFrame, best_row: pd.Series) -> None:
     print(f"\n  Saved: {BOOTSTRAP_FIGURE_V2.name}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 # Main
-# ─────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 
 def main() -> pd.DataFrame:
     print("=" * 70)
-    print(f"  BOOTSTRAP VALIDATION v2 — Model 1 + Model 2")
-    print(f"  Iteration 1       : HARDCODED {HARDCODED_HELD_OUT}")
-    print(f"  Iterations 2–{N_TOTAL_ITERATIONS} : {N_RANDOM_ITERATIONS} "
-          f"random one-per-field draws (from config.BOOTSTRAP_N_ITERATIONS)")
+    print(f"  BOOTSTRAP VALIDATION v2 - Model 1 + Model 2")
+    print(f"  {N_DRAWS} random one-per-field draws "
+          f"(from config.BOOTSTRAP_N_ITERATIONS)")
     print(f"  Selection         : objective={SELECTION_OBJECTIVE}, "
-          f"require_beat_all={SELECTION_REQUIRE_BEAT_ALL}, one per field")
+          f"require_beat_all={SELECTION_REQUIRE_BEAT_ALL}")
+    print(f"  SHAP              : {'ON' if COMPUTE_SHAP else 'OFF'}")
     print(f"  Seed              : {BOOTSTRAP_SEED}")
     print(f"  Output results    : {BOOTSTRAP_RESULTS_V2.name}")
     print(f"  Output selection  : {SELECTED_BASINS_V2.name}")
     print("=" * 70)
 
-    if N_RANDOM_ITERATIONS < 100:
-        print(f"\n  ⚠ WARNING: config.BOOTSTRAP_N_ITERATIONS = {N_RANDOM_ITERATIONS}. "
-              f"The paper reports 500 random draws — set it to 500 in config.py.")
+    if N_DRAWS < 500:
+        print(f"\n  WARNING: config.BOOTSTRAP_N_ITERATIONS = {N_DRAWS}. "
+              f"The paper reports 500 random draws - set it to 500 in config.py.")
 
     print("\n--- Loading data ---")
     outlier_basins             = load_outlier_basins()
@@ -736,15 +710,15 @@ def main() -> pd.DataFrame:
     results = run_bootstrap(
         event_df, reset_df, feat_cols_m1, eligible_by_field)
 
-    print(f"\n  Completed {len(results)} iterations")
+    print(f"\n  Completed {len(results)} draws")
     results.to_csv(BOOTSTRAP_RESULTS_V2, index=False)
     print(f"  Saved: {BOOTSTRAP_RESULTS_V2.name}")
 
-    print("\n--- Selecting reporting iteration ---")
+    print("\n--- Selecting reporting draw ---")
     best_row = select_best_iteration(results)
 
     write_selected_basins(best_row)
-    print_summary(results, best_row)
+    print_summary(results, best_row);9
 
     print("\n--- Generating histogram ---")
     plot_histogram(results, best_row)
@@ -757,6 +731,8 @@ def main() -> pd.DataFrame:
     print(f"  Then run:")
     print(f"    python -m models.model1_decay")
     print(f"    python -m models.model2_reset")
+    if COMPUTE_SHAP:
+        print(f"    python -m figures.fig6_bootstrap_shap")
     print("\nDone.")
     return results
 

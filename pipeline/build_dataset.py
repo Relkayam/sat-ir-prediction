@@ -1,18 +1,50 @@
 """
-pipeline/build_dataset.py — Build event_dataset.csv from DuckDB
-================================================================
+pipeline/build_dataset.py — Build event_dataset.csv from DuckDB  (v2)
+======================================================================
 Reads all flooding events for all basins, applies the four SENSOR-quality
 filters, identifies segments, computes features, and saves a single CSV.
 
 Every raw event is KEPT in the CSV with a filter_reason column.
+
+FIX IN THIS VERSION (2026-07, Roy Elkayam)
+--------------------------------------------
+_compute_ird_at_reset previously did:
+    if df.loc[seg_mask, "IRD_at_reset"].notna().any():
+        continue  # already populated — trust the database value
+The DB's IRD_at_reset column is forward-filled by
+optisat.etl.features.tillage_features.build_tillage_features, which applies
+its OWN separate "credibility" gate (drainage-response threshold + a 15-day
+minimum spacing) to decide which tillage events earn a new ceiling. That is
+a DIFFERENT segmentation than _ceiling_reset_search below (which segments on
+EVERY cleaned tillage timestamp, no credibility gate -- Roy's article design:
+every tillage-triggered reset is a real segment boundary, "good or bad").
+Trusting the DB value silently imported the credibility-gated segmentation's
+ceiling into a dataset that was never supposed to use it. Confirmed root
+cause via smoke_reset_ird_mismatch.py (0% of zero-delta resets were
+self-derived vs 93.5% of non-zero-delta ones) and smoke_reset_nan_ird.py
+(own IRD is essentially never NaN -- 0.0% -- so this was never a failed-fit/
+IRD_MAX issue, purely a wrong-anchor issue). This matters beyond the ceiling:
+IRD_norm/IRD_norm_log (TARGET_M1, Model 1's target in the FIRST paper) is
+computed from this same column for every event, not just the reset rows.
+
+_compute_ird_at_reset now ALWAYS sets IRD_at_reset from the segment's own
+reset event's own fitted IRD -- the DB value is never consulted for this,
+full stop. The original DB value is preserved as IRD_at_reset_db_original
+for before/after comparison only. A permanent consistency assertion
+(_assert_ceiling_consistency) runs at the end of build_basin_dataset and
+fails loudly if the ceiling is ever not self-derived for every row.
+
+Everything else in this file (segmentation itself, quality filtering,
+prev_*/cum_* features, decay diagnostic, splits) is UNCHANGED from v1.
 
 PIPELINE ORDER (fixed)
 ----------------------
   1. Read raw events
   2. Fill zero drying
   3. Segmentation on ALL raw events (ceiling reset search)
-     → assigns segment_id, row_type, IRD_at_reset to every event
-  4. Compute IRD_norm on ALL events (needs IRD_at_reset from step 3)
+     → assigns segment_id, row_type to every event
+  3c. Ceiling ALWAYS from the segment's own reset event (this fix)
+  4. Compute IRD_norm on ALL events (needs the corrected IRD_at_reset)
   5. Compute HL on ALL events
   6. Tag quality filter (marks filter_reason — does NOT drop rows)
   7. Split into passed / filtered subsets
@@ -21,24 +53,13 @@ PIPELINE ORDER (fixed)
   9. Fit per-segment decay (DIAGNOSTIC ONLY — see note), assign splits
  10. Reassemble full df and attach metadata
 
-Rationale for this order
--------------------------
-  Segmentation must run before quality filtering because the reset
-  anchor event (highest IRD after tillage) may itself fail a quality
-  filter (e.g. low IRD_R_squared on the first flooding after tillage).
-  Filtering first caused basins with poor-quality reset events to lose
-  their entire segment structure — IRD_at_reset was NaN for all rows.
-
 WHAT FILTERS THE MODEL DATA (and what does NOT)
 -----------------------------------------------
   Condition E-full uses EVERY event that passes the four sensor-quality
   filters defined in QUALITY_FILTER (IRD_R² ≥ 0.94, CIV ≥ 3000, Ct ≥ 20,
   AL ≥ 5) and is not a pre-segment row. There is NO segment-level quality
-  gate of any kind: no is_good_segment flag, no Pearson screen, no decay-R²
-  threshold. The per-segment exponential decay fit computed in step 9
-  (seg_lambda / seg_a / seg_b / seg_r2) is a DIAGNOSTIC retained only for
-  the Figure 2 overlays and the fitted-decay-rate range in the Discussion.
-  It does not exclude, select, or weight any event.
+  gate of any kind. The per-segment exponential decay fit (step 9) is a
+  DIAGNOSTIC only — see its docstring.
 
 basin_role values
 -----------------
@@ -83,6 +104,7 @@ print("Imports OK")
 
 _NEAR_ZERO_DRT      = 0.1
 _DRYING_WINDOW_COLS = ["RD", "TD", "HD", "WDD", "WSD", "PD"]
+_CEILING_TOL        = 1e-6  # tolerance for the self-derived consistency check
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -139,7 +161,7 @@ def _fill_zero_drying(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 3 — Segmentation on ALL raw events
+# Step 3 — Segmentation on ALL raw events  (UNCHANGED from v1)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _identify_segments(df_raw: pd.DataFrame) -> pd.DataFrame:
@@ -174,13 +196,13 @@ def _ceiling_reset_search(df_raw: pd.DataFrame, basin_number: int) -> pd.DataFra
 
     Runs on ALL raw events (before quality filtering) so that:
     - Reset anchor events are found even if they fail quality filters
-    - IRD_at_reset is populated for every event in the segment
-    - Quality filtering in step 6 can then mark individual events
-      without destroying the segment structure
+    - Segment structure survives quality filtering in step 6
 
-    The internal `quality` mask (event_quality_ok) still guides which
-    events are preferred as reset anchors — it just no longer gates
-    which events are available for the search.
+    UNCHANGED from v1. The internal `quality` mask (event_quality_ok) still
+    guides WHICH nearby event is preferred as the anchor for a given tillage
+    timestamp — that part was never the bug. The bug was downstream, in
+    _compute_ird_at_reset trusting a ceiling computed under a DIFFERENT
+    segmentation (tillage_features.py's credibility-gated one) — fixed below.
     """
     path = SatixPaths.BASIN_DB_DIR / f"basin_{int(basin_number)}.duckdb"
     if not path.exists():
@@ -203,7 +225,6 @@ def _ceiling_reset_search(df_raw: pd.DataFrame, basin_number: int) -> pd.DataFra
     times_ns = df_scored["opening_valve_date"].values.astype("int64")
     ird_vals = pd.to_numeric(df_scored["IRD"], errors="coerce").to_numpy(float)
 
-    # event_quality_ok guides anchor preference but all events are candidates
     quality  = (df_scored["event_quality_ok"].fillna(False).to_numpy(dtype=bool)
                 if "event_quality_ok" in df_scored.columns
                 else np.ones(len(df_scored), dtype=bool))
@@ -216,13 +237,11 @@ def _ceiling_reset_search(df_raw: pd.DataFrame, basin_number: int) -> pd.DataFra
 
     reset_event_indices: list[int] = []
     for tau_ns in till_ns:
-        # Prefer quality-passing events as anchors; fall back to any event
         before_q = np.where(
             (times_ns >= tau_ns - _back_ns) & (times_ns < tau_ns) & quality)[0]
         after_q  = np.where(
             (times_ns >= tau_ns) & (times_ns <= tau_ns + _wait_ns) & quality)[0]
 
-        # Fallback: any event in window (not just quality-passing)
         before_any = np.where(
             (times_ns >= tau_ns - _back_ns) & (times_ns < tau_ns))[0]
         after_any  = np.where(
@@ -269,91 +288,101 @@ def _ceiling_reset_search(df_raw: pd.DataFrame, basin_number: int) -> pd.DataFra
     return df
 
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 3b — Recompute LCT where NaN (from segmentation results)
+# Step 3b — Recompute LCT where NaN (from segmentation results)  (UNCHANGED)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _compute_lct(df: pd.DataFrame) -> pd.DataFrame:
     """
     Fill LCT (hours since tillage reset) where NaN, from segmentation results.
-
     LCT = (opening_valve_date - reset_date).total_seconds() / 3600.
-    At the reset event: LCT = 0.
-
-    Only fills NaN values — database values are preserved for normal basins.
+    At the reset event: LCT = 0. Only fills NaN — database values preserved.
     """
     df = df.copy()
-
     for sid, grp in df.groupby("segment_id"):
         if sid < 0:
             continue
-
         grp = grp.sort_values("opening_valve_date")
         reset_rows = grp[grp["row_type"] == "reset"]
         if reset_rows.empty:
             continue
-
         reset_date = reset_rows["opening_valve_date"].iloc[0]
-        hours = (
-            grp["opening_valve_date"] - reset_date
-        ).dt.total_seconds() / 3600.0
-
-        # Only fill NaN LCT values — preserve database values where available
+        hours = (grp["opening_valve_date"] - reset_date).dt.total_seconds() / 3600.0
         lct_col   = pd.to_numeric(grp["LCT"], errors="coerce")
         needs_fill = lct_col.isna()
         if needs_fill.any():
             df.loc[grp.index[needs_fill], "LCT"] = hours.values[needs_fill.values]
-
     return df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 3c — Fill IRD_at_reset where NaN (from segmentation results)
+# Step 3c — Ceiling: ALWAYS from the segment's own reset event  (FIXED)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _compute_ird_at_reset(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Fill IRD_at_reset from the reset event's IRD value where NaN.
-
-    IRD_at_reset is pre-computed by optisat for most basins, but is NaN for
-    basins where the reset anchor was quality-filtered in the old pipeline.
-    Only fills NaN — database values are preserved.
+    Set IRD_at_reset for every row in a segment to that segment's own reset
+    event's own fitted IRD. UNCONDITIONAL -- the DB's original IRD_at_reset
+    value is NEVER consulted or trusted here anymore (see module docstring
+    for why). The original DB value is preserved as IRD_at_reset_db_original,
+    for before/after comparison only -- nothing downstream reads it.
     """
     df = df.copy()
+    df["IRD_at_reset_db_original"] = df["IRD_at_reset"]
 
     for sid, grp in df.groupby("segment_id"):
         if sid < 0:
             continue
-
-        reset_rows = grp[grp["row_type"] == "reset"]
-        if reset_rows.empty:
-            continue
-
         seg_mask = df["segment_id"] == sid
-
-        # Only fill if IRD_at_reset is NaN for this segment
-        if df.loc[seg_mask, "IRD_at_reset"].notna().any():
-            continue  # already populated — trust the database value
-
-        reset_ird = pd.to_numeric(reset_rows["IRD"].iloc[0], errors="coerce")
-        if not np.isfinite(reset_ird):
+        reset_rows = grp[grp["row_type"] == "reset"].sort_values("opening_valve_date")
+        if reset_rows.empty:
+            df.loc[seg_mask, "IRD_at_reset"] = np.nan
             continue
+        reset_ird = pd.to_numeric(reset_rows["IRD"].iloc[0], errors="coerce")
+        df.loc[seg_mask, "IRD_at_reset"] = (
+            float(reset_ird) if np.isfinite(reset_ird) else np.nan
+        )
 
-        df.loc[seg_mask, "IRD_at_reset"] = reset_ird
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_gap = np.log(df["IRD_at_reset_db_original"] / df["IRD_at_reset"])
+    df["ceiling_was_inherited"] = np.abs(log_gap) >= _CEILING_TOL  # diagnostic only
 
     return df
 
 
+def _assert_ceiling_consistency(df: pd.DataFrame, basin_number: int) -> None:
+    """
+    Permanent guard: every row's IRD_at_reset must equal its segment's own
+    reset event's own IRD, everywhere. Fails loudly, not silently, if the
+    ceiling-source fix above is ever broken by a future edit.
+    """
+    n_bad = 0
+    for sid, grp in df[df["segment_id"] >= 0].groupby("segment_id"):
+        reset_rows = grp[grp["row_type"] == "reset"].sort_values("opening_valve_date")
+        if reset_rows.empty:
+            continue
+        expected = pd.to_numeric(reset_rows["IRD"].iloc[0], errors="coerce")
+        if not np.isfinite(expected):
+            continue
+        ceilings = pd.to_numeric(grp["IRD_at_reset"], errors="coerce").dropna()
+        if not np.allclose(ceilings, expected, atol=1e-9):
+            n_bad += 1
+    assert n_bad == 0, (
+        f"[basin {basin_number}] {n_bad} segments have IRD_at_reset that does "
+        "NOT match their own reset event's own IRD -- the ceiling-source fix "
+        "is broken. Fix before proceeding."
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Steps 4 & 5 — IRD_norm and HL (on all events, after segmentation)
+# Steps 4 & 5 — IRD_norm and HL (on all events, after segmentation)  (UNCHANGED)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _compute_ird_norm(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute IRD_norm = ln(IRD / IRD_at_reset) for ALL events.
-    IRD_at_reset is populated from the full-data segmentation step,
-    so this works even for events that will later be quality-filtered.
+    Compute IRD_norm = ln(IRD / IRD_at_reset) for ALL events. IRD_at_reset is
+    now the CORRECTED, self-derived ceiling from step 3c -- this is also
+    TARGET_M1 (IRD_norm_log = IRD_norm), so Model 1's target changes with it.
     """
     df = df.copy()
     ird       = pd.to_numeric(df["IRD"],          errors="coerce")
@@ -370,33 +399,24 @@ def _compute_hl(df: pd.DataFrame, area_m2: float) -> pd.DataFrame:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 6 — Tag quality filter (marks filter_reason — does NOT drop rows)
+#          (UNCHANGED)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _tag_quality_filter(df: pd.DataFrame) -> pd.DataFrame:
     """
     Mark filter_reason for events that fail the four SENSOR-quality thresholds.
-    pre_segment rows already have filter_reason = 'pre_segment' from
-    segmentation; this step adds quality flags to the remaining rows.
     Does NOT remove any rows — all events remain in the dataframe.
-
-    NOTE: This is the ONLY step that excludes events from the model data.
-    There is no segment-level quality gate anywhere in this pipeline.
     """
     df = df.copy()
-
-    # Initialise filter_reason if not already set by segmentation
     if "filter_reason" not in df.columns:
         df["filter_reason"] = ""
     else:
-        # Keep pre_segment labels; clear everything else for re-evaluation
         df["filter_reason"] = df["filter_reason"].where(
             df["filter_reason"] == "pre_segment", "")
 
-    # after_cutoff — applied to all rows regardless of segment status
     after = df["opening_valve_date"] >= pd.Timestamp(DATA_CUTOFF)
     df.loc[after & (df["filter_reason"] == ""), "filter_reason"] = "after_cutoff"
 
-    # sensor / operational quality filters
     for col, threshold in QUALITY_FILTER.items():
         if col not in df.columns:
             continue
@@ -409,27 +429,15 @@ def _tag_quality_filter(df: pd.DataFrame) -> pd.DataFrame:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Steps 7 & 8 — prev_* and cum_* features (on quality-passing events only)
+#               (UNCHANGED)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _compute_prev_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Compute lag features within each segment, on quality-passing events only.
-    This prevents a quality-filtered event from corrupting the lag for the
-    next good event in the same segment.
 
-    ┌─────────────────────────────────────────────────────────────────────────┐
-    │ ⚠ IMPORTANT — segment_id IS NOT GLOBALLY UNIQUE.                          │
-    │                                                                           │
-    │ segment_id is a PER-BASIN counter that restarts at 1 for every basin     │
-    │ (see _ceiling_reset_search / _identify_segments). The groupby below is   │
-    │ therefore correct ONLY because build_basin_dataset() calls this function │
-    │ on ONE basin at a time, BEFORE pool_basins() concatenates all 50 basins. │
-    │                                                                           │
-    │ NEVER call _compute_prev_features (or _compute_cum_features) on the       │
-    │ POOLED dataframe: segment 1 of basin 3203 and segment 1 of basin 4401    │
-    │ would silently merge and the lag would jump across basins. If you ever   │
-    │ need a global key, build one as f"{basin_number}_{segment_id}" first.    │
-    └─────────────────────────────────────────────────────────────────────────┘
+    ⚠ segment_id IS NOT GLOBALLY UNIQUE — this MUST run per-basin, before
+    pool_basins() concatenates all 50 basins. See build_basin_dataset().
     """
     df = df.copy()
     for col in PREV_SOURCE_COLS:
@@ -445,8 +453,7 @@ def _compute_prev_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _compute_cum_features(df: pd.DataFrame) -> pd.DataFrame:
-    # ⚠ Same per-basin segment_id caveat as _compute_prev_features above:
-    #   this MUST run per-basin (pre-pooling), never on the pooled frame.
+    # ⚠ Same per-basin segment_id caveat as _compute_prev_features above.
     df = df.copy()
     for cum_col, src_col in CUM_SOURCE_COLS.items():
         df[cum_col] = np.nan
@@ -466,7 +473,9 @@ def _compute_cum_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 8b — Cross-segment features
+# Step 8b — Cross-segment features  (UNCHANGED — now consistent by
+#           construction, since IRD_at_reset itself is now self-derived
+#           for every segment)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _add_cross_segment_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -521,7 +530,7 @@ def _add_cross_segment_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 9 — Per-segment decay fit  (DIAGNOSTIC ONLY — does NOT gate any event)
+# Step 9 — Per-segment decay fit  (DIAGNOSTIC ONLY — UNCHANGED)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _decay_model(lct, a, b, lam):
@@ -549,26 +558,10 @@ def _fit_decay(lct: np.ndarray, inorm: np.ndarray) -> Optional[dict]:
         return None
 
 
-def _fit_segment_decay(
-    df:          pd.DataFrame,
-    passed_mask: pd.Series,
-) -> pd.DataFrame:
+def _fit_segment_decay(df: pd.DataFrame, passed_mask: pd.Series) -> pd.DataFrame:
     """
-    Fit a per-segment exponential decay to normalized IRD (η vs LCT) on
-    quality-passing event rows, and broadcast the fit parameters
-    (seg_lambda, seg_a, seg_b, seg_r2) to ALL rows of each segment.
-
-    ───────────────────────────────────────────────────────────────────────────
-    DIAGNOSTIC ONLY. These parameters are NOT used to filter, gate, select, or
-    weight any event for model training or evaluation. There is no
-    'is_good_segment' flag and no segment is ever excluded on the basis of fit
-    quality. The fit exists solely to support:
-      - the dashed exponential overlays in Figure 2, and
-      - the fitted-decay-rate (seg_lambda) range reported in the Discussion.
-    If Figure 2 ever refits independently and does not read seg_lambda from the
-    CSV, this entire step (and _fit_decay / _decay_model / curve_fit) can be
-    deleted without affecting any model result.
-    ───────────────────────────────────────────────────────────────────────────
+    DIAGNOSTIC ONLY -- does not filter/gate/select/weight any event. See v1
+    docstring for full rationale; unchanged here.
     """
     df        = df.copy()
     df_passed = df[passed_mask]
@@ -594,30 +587,17 @@ def _fit_segment_decay(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 10 — Assign splits
+# Step 10 — Assign splits  (UNCHANGED)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _assign_splits(
-    df:          pd.DataFrame,
-    passed_mask: pd.Series,
-) -> pd.DataFrame:
+def _assign_splits(df: pd.DataFrame, passed_mask: pd.Series) -> pd.DataFrame:
     """
     Random 80/20 train/val split BY SEGMENT, applied to ALL segments that
     contain at least one quality-passing event.
-
-    Splitting at the segment level (not the event level) prevents leakage
-    between consecutive events of the same segment. Condition E-full uses every
-    event that passes the four sensor-quality filters — there is no
-    is_good_segment gate.
-
-      reset rows           → split == 'reset'
-      non-quality-passing  → split == 'excluded'
-      passing event rows   → split in {'train', 'val'} by segment
     """
     df = df.copy()
     df["split"] = "excluded"
 
-    # All segments with at least one quality-passing event
     all_segments = sorted([s for s in df["segment_id"].unique() if s >= 0])
     if not all_segments:
         return df
@@ -645,7 +625,7 @@ def _assign_splits(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Metadata helpers
+# Metadata helpers  (UNCHANGED)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _attach_metadata(df: pd.DataFrame, basin_number: int, area_m2: float) -> None:
@@ -672,14 +652,14 @@ def build_basin_dataset(basin_number: int) -> Optional[pd.DataFrame]:
     df = _fill_zero_drying(df)
 
     # ── Step 3: segmentation on ALL raw events ────────────────────────────────
-    # Must run before quality filtering so reset anchors are never filtered out
     df = _ceiling_reset_search(df, basin_number)
 
     # ── Step 3b: recompute LCT from segmentation results ─────────────────────
     df = _compute_lct(df)
 
-    # ── Step 3c: fill IRD_at_reset where NaN ─────────────────────────────────
+    # ── Step 3c: ceiling ALWAYS from the segment's own reset event (FIXED) ───
     df = _compute_ird_at_reset(df)
+    _assert_ceiling_consistency(df, basin_number)
 
     # ── Steps 4 & 5: IRD_norm and HL on ALL events ───────────────────────────
     df = _compute_ird_norm(df)
@@ -688,13 +668,10 @@ def build_basin_dataset(basin_number: int) -> Optional[pd.DataFrame]:
     # ── Step 6: quality filter (marks filter_reason, keeps all rows) ─────────
     df = _tag_quality_filter(df)
 
-    # passed_mask: events that pass all four sensor-quality filters
-    # (pre_segment rows are also excluded via their filter_reason)
     passed_mask = df["filter_reason"] == ""
     n_passed    = int(passed_mask.sum())
 
     if n_passed < 10:
-        # Too few quality-passing events to be useful — mark whole basin
         df["split"] = "excluded"
         _attach_metadata(df, basin_number, area_m2)
         print(f"  [{basin_number:>5}]  raw={n_raw:>5}  qpass={n_passed:>5}  "
@@ -702,15 +679,11 @@ def build_basin_dataset(basin_number: int) -> Optional[pd.DataFrame]:
         return df
 
     # ── Steps 7 & 8: lag features on quality-passing events only ─────────────
-    # See the per-basin segment_id warning inside _compute_prev_features:
-    # this MUST run on a single-basin frame, which is the case here.
     df_passed = df[passed_mask].copy().reset_index(drop=True)
     df_passed = _compute_prev_features(df_passed)
     df_passed = _compute_cum_features(df_passed)
     df_passed = _add_cross_segment_features(df_passed)
 
-    # Merge computed features back into full df using pd.concat.
-    # Strategy: keep all non-passed rows from df, replace passed rows with df_passed.
     df_not_passed = df[~passed_mask].copy()
 
     for col in df_passed.columns:
@@ -730,7 +703,6 @@ def build_basin_dataset(basin_number: int) -> Optional[pd.DataFrame]:
     df = pd.concat([df_passed, df_not_passed], ignore_index=True)
     df = df.sort_values("opening_valve_date").reset_index(drop=True)
 
-    # Rebuild passed_mask after concat + sort (index was reset)
     passed_mask = df["filter_reason"] == ""
 
     # ── Step 9: per-segment decay fit (DIAGNOSTIC ONLY — gates nothing) ──────
@@ -743,15 +715,17 @@ def build_basin_dataset(basin_number: int) -> Optional[pd.DataFrame]:
 
     n_segments     = int(len([s for s in df["segment_id"].unique() if s >= 0]))
     n_passed_event = int(((df["row_type"] == "event") & passed_mask).sum())
+    n_ceiling_changed = int(df.loc[df["segment_id"] >= 0, "ceiling_was_inherited"].sum())
     print(
         f"  [{basin_number:>5}]  raw={n_raw:>5}  qpass={n_passed:>5}  "
-        f"segments={n_segments:>3}  passed_events={n_passed_event:>5}"
+        f"segments={n_segments:>3}  passed_events={n_passed_event:>5}  "
+        f"ceiling_changed_rows={n_ceiling_changed:>5}"
     )
     return df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# All basins
+# All basins  (UNCHANGED)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_all_basins() -> dict[int, pd.DataFrame]:
@@ -770,16 +744,13 @@ def build_all_basins() -> dict[int, pd.DataFrame]:
 
 
 def pool_basins(all_series: dict[int, pd.DataFrame]) -> pd.DataFrame:
-    # NOTE: prev_*/cum_* features are already computed per-basin inside
-    # build_basin_dataset BEFORE this concat — see the segment_id warning in
-    # _compute_prev_features. Do not (re)compute any segment lag here.
     if not all_series:
         return pd.DataFrame()
     return pd.concat(list(all_series.values()), ignore_index=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Filter funnel
+# Filter funnel  (UNCHANGED)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def print_filter_funnel(pooled: pd.DataFrame) -> pd.DataFrame:
@@ -787,14 +758,12 @@ def print_filter_funnel(pooled: pd.DataFrame) -> pd.DataFrame:
     after_cutoff_n = int(reason_counts.get("after_cutoff", 0))
     total_raw      = len(pooled) - after_cutoff_n
 
-    # Only the four SENSOR filters + pre_segment exclude events now.
-    # There is no segment-level quality gate, so no decay-screening rows here.
     step_order = [
         ("Raw events (study period)",                None),
         ("Drainage R² < 0.94 (sensor quality)",     "quality_filter_IRD_R_squared"),
         ("CIV < 3,000 m³",                          "quality_filter_CIV"),
-        ("Ct < 20 h",                               "quality_filter_Ct"),
-        ("AL < 5 cm",                               "quality_filter_AL"),
+        ("Ct < 20 h",                                "quality_filter_Ct"),
+        ("AL < 5 cm",                                "quality_filter_AL"),
         ("Pre-segment (before 1st reset)",          "pre_segment"),
         ("Passed events (used by the models)",      ""),
     ]
@@ -832,14 +801,17 @@ def print_filter_funnel(pooled: pd.DataFrame) -> pd.DataFrame:
 
 def main(force_rebuild: bool = False) -> pd.DataFrame:
     print("="*65)
-    print("  BUILD DATASET — pipeline/build_dataset.py")
+    print("  BUILD DATASET (v2) — pipeline/build_dataset.py")
     print("="*65)
     print(f"  QUALITY_FILTER         : {QUALITY_FILTER}")
     print(f"  MIN_EVENTS_PER_SEGMENT : {MIN_EVENTS_PER_SEGMENT} (decay-fit guard only)")
     print(f"  DATA_CUTOFF            : {DATA_CUTOFF} (enforced at SQL read level)")
     print(f"  Split                  : 80% train / 20% val by segment (no internal test)")
-    print(f"  Pipeline order         : segment → IRD_norm → quality_filter → features")
+    print(f"  Pipeline order         : segment → ceiling(self-derived) → IRD_norm → "
+          f"quality_filter → features")
     print(f"  Segment quality gate   : NONE — all sensor-passing events are used")
+    print(f"  Ceiling source         : ALWAYS the segment's own reset event's own IRD "
+          f"(fixed this session — see module docstring)")
     print(f"  NOTE: No fixed held-out basins — selection at bootstrap runtime")
     print()
 
@@ -859,6 +831,13 @@ def main(force_rebuild: bool = False) -> pd.DataFrame:
         print(f"\n  Saved: {EVENT_CSV}  ({len(pooled)} rows)")
 
     print_filter_funnel(pooled)
+
+    if "ceiling_was_inherited" in pooled.columns:
+        seg_rows = pooled[pooled["segment_id"] >= 0]
+        n_changed = int(seg_rows["ceiling_was_inherited"].sum())
+        print(f"\n  Ceiling correction: {n_changed} / {len(seg_rows)} "
+              f"({100*n_changed/len(seg_rows):.1f}%) rows now have a different "
+              f"IRD_at_reset than the old DB-sourced value.")
 
     passed_events = int(((pooled.get("row_type", "") == "event") &
                          (pooled.get("filter_reason", "") == "")).sum())
