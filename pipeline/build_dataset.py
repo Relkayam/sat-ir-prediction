@@ -187,6 +187,10 @@ def _identify_segments(df_raw: pd.DataFrame) -> pd.DataFrame:
     df["row_type"]   = row_type
     df["segment_id"] = seg_id_arr
     # pre_segment rows will get filter_reason assigned in step 6
+
+    df["anchor_side"] = pd.NA
+    df["anchor_runnerup_IRD"] = np.nan
+
     return df
 
 
@@ -235,20 +239,53 @@ def _ceiling_reset_search(df_raw: pd.DataFrame, basin_number: int) -> pd.DataFra
                                 ).total_seconds() * 1e9)
     till_ns  = tillage_df["timestamp"].values.astype("int64")
 
+    # reset_event_indices: list[int] = []
+    # for tau_ns in till_ns:
+    #     before_q = np.where(
+    #         (times_ns >= tau_ns - _back_ns) & (times_ns < tau_ns) & quality)[0]
+    #     after_q  = np.where(
+    #         (times_ns >= tau_ns) & (times_ns <= tau_ns + _wait_ns) & quality)[0]
+    #
+    #     before_any = np.where(
+    #         (times_ns >= tau_ns - _back_ns) & (times_ns < tau_ns))[0]
+    #     after_any  = np.where(
+    #         (times_ns >= tau_ns) & (times_ns <= tau_ns + _wait_ns))[0]
+    #
+    #     before_pos = before_q if len(before_q) > 0 else before_any
+    #     after_pos  = after_q  if len(after_q)  > 0 else after_any
+    #
+    #     ird_1 = (float(ird_vals[before_pos[-1]])
+    #              if len(before_pos) and np.isfinite(ird_vals[before_pos[-1]])
+    #              else np.nan)
+    #     ird_2 = (float(ird_vals[after_pos[0]])
+    #              if len(after_pos) and np.isfinite(ird_vals[after_pos[0]])
+    #              else np.nan)
+    #
+    #     if np.isfinite(ird_1) and np.isfinite(ird_2):
+    #         chosen = int(before_pos[-1]) if ird_1 >= ird_2 else int(after_pos[0])
+    #     elif np.isfinite(ird_1):
+    #         chosen = int(before_pos[-1])
+    #     elif np.isfinite(ird_2):
+    #         chosen = int(after_pos[0])
+    #     else:
+    #         continue
+    #     reset_event_indices.append(chosen)
+
     reset_event_indices: list[int] = []
+    anchor_info: dict[int, tuple[str, float]] = {}  # idx -> (side, runnerup)
     for tau_ns in till_ns:
         before_q = np.where(
             (times_ns >= tau_ns - _back_ns) & (times_ns < tau_ns) & quality)[0]
-        after_q  = np.where(
+        after_q = np.where(
             (times_ns >= tau_ns) & (times_ns <= tau_ns + _wait_ns) & quality)[0]
 
         before_any = np.where(
             (times_ns >= tau_ns - _back_ns) & (times_ns < tau_ns))[0]
-        after_any  = np.where(
+        after_any = np.where(
             (times_ns >= tau_ns) & (times_ns <= tau_ns + _wait_ns))[0]
 
         before_pos = before_q if len(before_q) > 0 else before_any
-        after_pos  = after_q  if len(after_q)  > 0 else after_any
+        after_pos = after_q if len(after_q) > 0 else after_any
 
         ird_1 = (float(ird_vals[before_pos[-1]])
                  if len(before_pos) and np.isfinite(ird_vals[before_pos[-1]])
@@ -258,14 +295,18 @@ def _ceiling_reset_search(df_raw: pd.DataFrame, basin_number: int) -> pd.DataFra
                  else np.nan)
 
         if np.isfinite(ird_1) and np.isfinite(ird_2):
-            chosen = int(before_pos[-1]) if ird_1 >= ird_2 else int(after_pos[0])
+            if ird_1 >= ird_2:
+                chosen, side, runnerup = int(before_pos[-1]), "before", ird_2
+            else:
+                chosen, side, runnerup = int(after_pos[0]), "after", ird_1
         elif np.isfinite(ird_1):
-            chosen = int(before_pos[-1])
+            chosen, side, runnerup = int(before_pos[-1]), "before", np.nan
         elif np.isfinite(ird_2):
-            chosen = int(after_pos[0])
+            chosen, side, runnerup = int(after_pos[0]), "after", np.nan
         else:
             continue
         reset_event_indices.append(chosen)
+        anchor_info[chosen] = (side, runnerup)  # last tillage wins on dup
 
     reset_event_indices = sorted(set(reset_event_indices))
     if not reset_event_indices:
@@ -285,6 +326,15 @@ def _ceiling_reset_search(df_raw: pd.DataFrame, basin_number: int) -> pd.DataFra
             seg_id_arr[i] = seg_counter
     df["row_type"]   = row_type
     df["segment_id"] = seg_id_arr
+
+    df["anchor_side"] = pd.NA
+    df["anchor_runnerup_IRD"] = np.nan
+    for idx, (side, runnerup) in anchor_info.items():
+        df.loc[df.index[idx], "anchor_side"] = side
+        df.loc[df.index[idx], "anchor_runnerup_IRD"] = runnerup
+
+
+
     return df
 
 
