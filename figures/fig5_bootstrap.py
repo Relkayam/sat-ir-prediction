@@ -63,11 +63,11 @@ def _covers_all_fields(held_out_str: str) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_data() -> tuple[pd.DataFrame, pd.Series, int]:
-    if not BOOTSTRAP_RESULTS_V2.exists():
-        raise FileNotFoundError(
-            f"{BOOTSTRAP_RESULTS_V2} not found.\n"
-            "Run: python -m experiments.run_bootstrap_v2"
-        )
+    # if not BOOTSTRAP_RESULTS_V2.exists():
+    #     raise FileNotFoundError(
+    #         f"{BOOTSTRAP_RESULTS_V2} not found.\n"
+    #         "Run: python -m experiments.run_bootstrap_v2"
+    #     )
     results = pd.read_csv(BOOTSTRAP_RESULTS_V2)
 
     selected_iter = None

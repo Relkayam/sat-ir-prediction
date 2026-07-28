@@ -68,11 +68,21 @@ for _dir in [OUTPUTS_DIR, FIGURES_DIR, TABLES_DIR]:
 # ─────────────────────────────────────────────────────────────────────────────
 DATA_CUTOFF = "2025-01-01"
 
+# Minimum thresholds: an event is filtered if value < threshold.
 QUALITY_FILTER = {
     "IRD_R_squared": 0.94,
     "CIV":           3000,
     "Ct":            20,
     "AL":            5,
+}
+
+# Maximum thresholds: an event is filtered if value > ceiling.
+# Ct (cycle time) upper cap removes segmentation-stitching artifacts (>~p99),
+# e.g. spurious multi-thousand-hour "cycles". Because FT <= Ct for every event,
+# this Ct cap also subsumes the flooding-time (FT) outliers, so no separate FT
+# filter is needed. ~1.2% of events are removed at Ct <= 500.
+QUALITY_FILTER_MAX = {
+    "Ct": 500,
 }
 
 MIN_EVENTS_PER_SEGMENT    = 3

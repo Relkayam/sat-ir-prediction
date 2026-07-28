@@ -84,7 +84,7 @@ from scipy.optimize import curve_fit
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import (
-    DATA_CUTOFF, QUALITY_FILTER,
+    DATA_CUTOFF, QUALITY_FILTER, QUALITY_FILTER_MAX,
     MIN_EVENTS_PER_SEGMENT,
     TRAIN_FRAC, RANDOM_SEED,
     EVENT_CSV, TABLES_DIR, FIELD_NAMES,
@@ -474,6 +474,16 @@ def _tag_quality_filter(df: pd.DataFrame) -> pd.DataFrame:
         fails     = pd.to_numeric(df[col], errors="coerce").fillna(0) < threshold
         df.loc[unflagged & fails, "filter_reason"] = f"quality_filter_{col}"
 
+    # upper-bound filters (segmentation-artifact removal): flag rows whose
+    # value EXCEEDS the ceiling. Ct is the cycle time; FT <= Ct always, so a
+    # Ct cap subsumes the flooding-time outliers. NaN is left to the min loop.
+    for col, ceiling in QUALITY_FILTER_MAX.items():
+        if col not in df.columns:
+            continue
+        unflagged = df["filter_reason"] == ""
+        fails     = pd.to_numeric(df[col], errors="coerce") > ceiling
+        df.loc[unflagged & fails, "filter_reason"] = f"quality_filter_{col}_max"
+
     return df
 
 
@@ -854,6 +864,7 @@ def main(force_rebuild: bool = False) -> pd.DataFrame:
     print("  BUILD DATASET (v2) — pipeline/build_dataset.py")
     print("="*65)
     print(f"  QUALITY_FILTER         : {QUALITY_FILTER}")
+    print(f"  QUALITY_FILTER_MAX     : {QUALITY_FILTER_MAX}")
     print(f"  MIN_EVENTS_PER_SEGMENT : {MIN_EVENTS_PER_SEGMENT} (decay-fit guard only)")
     print(f"  DATA_CUTOFF            : {DATA_CUTOFF} (enforced at SQL read level)")
     print(f"  Split                  : 80% train / 20% val by segment (no internal test)")
