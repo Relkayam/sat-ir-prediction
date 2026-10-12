@@ -39,29 +39,29 @@ def plot_depth(tbl: pd.DataFrame, save_path: str | None = None) -> None:
     """Two-panel depth figure in the paper's house style.
     Left: RMSE vs depth for model and naive-at-lag. Right: delta-RMSE vs depth."""
     fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.2))
-    fig.suptitle("Model 1 vs naive-at-lag: skill as a function of within-segment "
-                 "depth (held-out basins)", fontsize=10, fontweight="bold")
+    # fig.suptitle("Model 1 vs naive-at-lag: skill as a function of within-segment "
+    #              "depth (held-out basins)", fontsize=10, fontweight="bold")
 
     d = tbl["depth"].to_numpy()
     axL.plot(d, tbl["rmse_naive"], "-o", color=NAIVE_COLOR, markersize=4,
              label="Naive-at-lag n")
     axL.plot(d, tbl["rmse_model"], "-o", color=DEFAULT_COLOR, markersize=4,
              label="Model 1 (one-step)")
-    axL.set_xlabel("Within-segment depth n (events)", fontsize=9)
-    axL.set_ylabel("RMSE (cm h$^{-1}$)", fontsize=9)
-    axL.grid(True, alpha=0.2); axL.legend(fontsize=8, loc="upper left")
-    axL.tick_params(labelsize=8)
+    axL.set_xlabel("Within-segment depth n (events)", fontsize=18)
+    axL.set_ylabel("RMSE (cm h$^{-1}$)", fontsize=18)
+    axL.grid(True, alpha=0.2); axL.legend(fontsize=14, loc="upper left")
+    axL.tick_params(labelsize=14)
 
     axR.axhline(0, color="black", linewidth=0.7, alpha=0.5)
     axR.plot(d, tbl["delta_rmse"], "-o", color=DELTA_COLOR, markersize=4)
-    axR.set_xlabel("Within-segment depth n (events)", fontsize=9)
-    axR.set_ylabel("delta-RMSE = naive - model (cm h$^{-1}$)", fontsize=9)
-    axR.grid(True, alpha=0.2); axR.tick_params(labelsize=8)
+    axR.set_xlabel("Within-segment depth n (events)", fontsize=18)
+    axR.set_ylabel("delta-RMSE = naive - model (cm h$^{-1}$)", fontsize=18)
+    axR.grid(True, alpha=0.2); axR.tick_params(labelsize=14)
     for i in range(0, len(d), max(1, len(d)//6)):
         axR.annotate(f"n={int(tbl['n_events'].iloc[i]):,}",
                      xy=(d[i], tbl["delta_rmse"].iloc[i]),
                      xytext=(0, 6), textcoords="offset points",
-                     fontsize=6.5, ha="center", color="gray")
+                     fontsize=10, ha="center", color="gray")
 
     plt.tight_layout(rect=[0, 0, 1, 0.94])
     if save_path:

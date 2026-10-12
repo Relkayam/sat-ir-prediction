@@ -47,6 +47,7 @@ FILTER_STEPS = [
     ("quality_filter_CIV",           "CIV < 3,000 m\u00b3",          "#E07B39"),
     ("quality_filter_Ct",            "t_cycle < 20 h",               "#E6B800"),
     ("quality_filter_AL",            "AL < 5 cm",                    "#7D9D3A"),
+    ("quality_filter_Ct_max",        "t_cycle > 500 h",              "#B07AA1"),
 ]
 PASS_COLOR = "#065A82"
 RAW_COLOR  = "#34495E"
@@ -132,9 +133,9 @@ def plot_funnel(f: pd.DataFrame) -> Path:
     ax.set_xlabel("Events remaining", fontsize=10)
     ax.set_xlim(0, raw * 1.18)
     pct = 100.0 * passed / raw if raw else 0
-    ax.set_title(f"Sensor-quality funnel: {passed:,} of {raw:,} events "
-                 f"({pct:.1f}%) pass all four thresholds",
-                 fontsize=10, fontweight="bold")
+    # ax.set_title(f"Sensor-quality funnel: {passed:,} of {raw:,} events "
+    #              f"({pct:.1f}%) pass all four thresholds",
+    #              fontsize=10, fontweight="bold")
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     ax.grid(True, axis="x", alpha=0.18, linestyle="--", linewidth=0.6)
